@@ -1,0 +1,41 @@
+program: train.py
+method: random
+metric:
+  goal: minimize
+  name: val_loss
+parameters:
+  # batch_size:
+  #   value: 32
+  # word_embed_size:
+  #   value: 16
+  # channels_v:
+  #   value: 32
+  # channels_e:
+  #   value: 32
+  lr:
+    min: 0.0001
+    max: 0.01
+  # epochs:
+  #   value: 5
+  # start_node_a:
+  #   min: 0.01
+  #   max: 0.5
+  # start_edge_a:
+  #   min: 0.01
+  #   max: 0.5
+  node_count:
+    values: [10, 20, 30]
+  message_config:
+    distribution: categorical
+    values: [0,1,2,3]
+  message_zero:
+    values: [True, False]
+  update_config:
+    distribution: categorical
+    values: [0,1,2]
+  update_zero:
+    values: [True, False]
+  reset_out_node:
+    values: [True, False]
+  step_edges:
+    values: [True, False]
