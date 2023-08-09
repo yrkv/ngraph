@@ -3,6 +3,9 @@ method: random
 metric:
   goal: minimize
   name: val_loss
+early_terminate:
+  type: hyperband
+  min_iter: 3
 parameters:
   # batch_size:
   #   value: 32
@@ -24,7 +27,8 @@ parameters:
   #   min: 0.01
   #   max: 0.5
   node_count:
-    values: [10, 20, 30]
+    value: 20
+    #values: [10, 20, 30]
   message_config:
     distribution: categorical
     values: [0,1,2,3]

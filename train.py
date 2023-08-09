@@ -20,7 +20,7 @@ config = {
     "channels_v": 64,
     "channels_e": 64,
     "lr": 0.001,
-    "epochs": 50,
+    "epochs": 10,
     "node_count": 20,
     "start_node_a": 0.2,
     "start_edge_a": 0.2,
@@ -34,14 +34,14 @@ config = {
     "edge_dropout_p": 0.0,
     "add_nodes": 0,
     "add_node_every": 1,
-    #"load_ckpt": None,
-    "load_ckpt": 'ngraph20_e15.pt',
+    "load_ckpt": None,
+    #"load_ckpt": 'ngraph20_e15.pt',
     #"load_ckpt": 'learngen20_e15.pt',
     #"load_ckpt": 'learn20_e10.pt',
     #"save_ckpt": None,
 
     # Do graphs share the same trainable base values?
-    'shared_base': True,
+    'shared_base': False,
 
     'persist': {
         # epochs to run with persist.fraction=0
@@ -49,7 +49,7 @@ config = {
         # epochs at which to have full persist.fraction
         'epoch_end': 0,
         # fraction of graphs to reset before each batch based on loss
-        'fraction': 0.0,
+        'reset_fraction': 1.0,
     }
 }
 
@@ -57,7 +57,7 @@ config = {
 
 # task config
 # BATCH_TOKENS = 35
-BATCH_TOKENS = 60
+BATCH_TOKENS = 40
 VOCAB_SIZE = 26
 #LANG_STAGES = [50, 50, 50, 50, VOCAB_SIZE]
 #LANG_STAGES = [500, 500, 500, 500, 500, 500, VOCAB_SIZE]
@@ -125,8 +125,8 @@ def train_epoch(ngraph, base_node, base_edge, emb, decoder,
         if x_data.shape != y_data.shape:
             continue
         
-        fraction = wandb.config['persist.fraction']
-        start, end = wandb.config['persist.epoch_start'], wandb.config['persist.epoch_end']
+        p = wandb.config['persist']
+        fraction, start, end = p['reset_fraction'], p['epoch_start'], p['epoch_end']
         actual_fraction = np.clip((epoch-start+1) / (end-start+1) * fraction, 0, fraction)
         reset_above = np.quantile(ngraph.scores, 1-actual_fraction)
         reset = torch.from_numpy(ngraph.scores > reset_above).to(DEVICE)
@@ -313,8 +313,6 @@ if __name__ == '__main__':
     run = wandb.init(config=config, project='ngraph')
     print(wandb.config)
 
-    assert False
-    
     lr = wandb.config['lr']
     bs = wandb.config['batch_size']
     epochs = wandb.config['epochs']
@@ -413,17 +411,17 @@ if __name__ == '__main__':
 
             # assert False
         evaluate(ngraph, base_node, base_edge, emb, decoder, test_data)
-        evaluate_learning(ngraph, base_node, base_edge, emb, decoder, learn_data)
+        #evaluate_learning(ngraph, base_node, base_edge, emb, decoder, learn_data)
         #torch.save(ngraph.to('cpu'), 'ngraph30_high_ch.pt')
-        if (epoch+1) % 5 == 0:
-            #torch.save({
-            #    'ngraph': ngraph.to('cpu'),
-            #    'emb': emb.to('cpu'),
-            #    'decoder': decoder.to('cpu'),
-            #}, f'learngen20_e{epoch+1}.pt')
-            ngraph.to(DEVICE)
-            emb.to(DEVICE)
-            decoder.to(DEVICE)
+      #  if (epoch+1) % 5 == 0:
+      #      #torch.save({
+      #      #    'ngraph': ngraph.to('cpu'),
+      #      #    'emb': emb.to('cpu'),
+      #      #    'decoder': decoder.to('cpu'),
+      #      #}, f'learngen20_e{epoch+1}.pt')
+      #      ngraph.to(DEVICE)
+      #      emb.to(DEVICE)
+      #      decoder.to(DEVICE)
 
 
 
