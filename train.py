@@ -45,6 +45,9 @@ def get_config():
     parser.add_argument('--load_ckpt', type=str, default=None)
     parser.add_argument('--save_ckpt', type=str, default=None)
 
+    parser.add_argument('--optimize_model', type=mbool, default=True)
+    parser.add_argument('--optimize_base', type=mbool, default=True)
+
     parser.add_argument('--shared_base', type=mbool, default=False,
                         help="do graphs share the same trainable base values?")
     parser.add_argument('--persist.epoch_start', type=int, default=0,
@@ -81,9 +84,6 @@ VOCAB_SIZE = 26
 LANG_STAGES = [50, 50, VOCAB_SIZE]
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-TUNE_INITIAL_VALUES = True
-FREEZE_MODEL = False
 
 INPUT_NODE = 0
 OUTPUT_NODE = 1
@@ -370,6 +370,9 @@ if __name__ == '__main__':
                          average_messages=True,
                          layers=3).to(DEVICE)
 
+    ngraph.reset_values(edge_a=wandb.config['start_edge_a'],
+                        node_a=wandb.config['start_node_a'])
+
     emb = nn.Embedding(VOCAB_SIZE, wandb.config['word_embed_size']).to(DEVICE)
     decoder = nn.Linear(wandb.config['word_embed_size'], VOCAB_SIZE).to(DEVICE)
 
@@ -380,25 +383,20 @@ if __name__ == '__main__':
         emb = loaded['emb'].to(DEVICE)
         decoder = loaded['decoder'].to(DEVICE)
 
-
-    if FREEZE_MODEL:
+    if not wandb.config['optimize_model']:
         ngraph.message.requires_grad_(False)
         ngraph.update.requires_grad_(False)
-
-    ngraph.reset_values(edge_a=wandb.config['start_edge_a'],
-                        node_a=wandb.config['start_node_a'])
 
     base_node = ngraph.node_vals.clone().detach().to(DEVICE)
     base_edge = ngraph.edge_vals.clone().detach().to(DEVICE)
 
-
-    if TUNE_INITIAL_VALUES:
+    if wandb.config['optimize_base']:
         base_node.requires_grad_(True)
         base_edge.requires_grad_(True)
 
 
     params = [*ngraph.parameters(), *emb.parameters(), *decoder.parameters()]
-    if TUNE_INITIAL_VALUES:
+    if wandb.config['optimize_base']:
         params.extend([base_node, base_edge])
 
     optimizer = torch.optim.AdamW(params, lr=lr)
@@ -428,6 +426,11 @@ if __name__ == '__main__':
         #torch.save(ngraph.to('cpu'), 'ngraph30_high_ch.pt')
 
         if wandb.config['save_ckpt'] is not None:
+
+            # saved checkpoint stores base values in the node/edge values
+            ngraph.node_vals += base_node - ngraph.node_vals
+            ngraph.edge_vals += base_edge - ngraph.edge_vals
+
             torch.save({
                 'ngraph': ngraph.to('cpu'),
                 'emb': emb.to('cpu'),
