@@ -1,5 +1,6 @@
 
 from functools import partial
+import argparse
 
 import torch
 import torch.nn as nn
@@ -14,45 +15,54 @@ from update import *
 import data
 
 
-config = {
-    "batch_size": 32,
-    "word_embed_size": 32,
-    "channels_v": 64,
-    "channels_e": 64,
-    "lr": 0.001,
-    "epochs": 10,
-    "node_count": 20,
-    "start_node_a": 0.2,
-    "start_edge_a": 0.2,
-    "message_config": 1,
-    "message_zero": False,
-    "update_config": 0,
-    "update_zero": False,
-    "reset_out_node": True,
-    "step_edges": True,
-    "node_dropout_p": 0.0,
-    "edge_dropout_p": 0.0,
-    "add_nodes": 0,
-    "add_node_every": 1,
-    "load_ckpt": None,
-    #"load_ckpt": 'ngraph20_e15.pt',
-    #"load_ckpt": 'learngen20_e15.pt',
-    #"load_ckpt": 'learn20_e10.pt',
-    #"save_ckpt": None,
+def get_config():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--word_embed_size', type=int, default=32)
+    parser.add_argument('--channels_v', type=int, default=64)
+    parser.add_argument('--channels_e', type=int, default=64)
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--node_count', type=int, default=20)
+    parser.add_argument('--start_node_a', type=float, default=0.2)
+    parser.add_argument('--start_edge_a', type=float, default=0.2)
+    parser.add_argument('--message_config', type=int, default=1)
+    parser.add_argument('--message_zero', type=bool, default=False)
+    parser.add_argument('--update_config', type=int, default=0)
+    parser.add_argument('--update_zero', type=bool, default=False)
+    parser.add_argument('--reset_out_node', type=bool, default=True)
+    parser.add_argument('--step_edges', type=bool, default=True)
+    parser.add_argument('--node_dropout_p', type=float, default=0.0)
+    parser.add_argument('--edge_dropout_p', type=float, default=0.0)
+    parser.add_argument('--add_nodes', type=int, default=0)
+    parser.add_argument('--add_node_every', type=int, default=1)
+    parser.add_argument('--load_ckpt', type=str, default=None)
+    parser.add_argument('--save_ckpt', type=str, default=None)
+    parser.add_argument('--shared_base', type=bool, default=False,
+                        help="do graphs share the same trainable base values?")
+    parser.add_argument('--persist.epoch_start', type=int, default=0,
+                        help="epochs to run with persist.reset_fraction=0")
+    parser.add_argument('--persist.epoch_end', type=int, default=0,
+                        help="epochs at which to have full persist.fraction")
+    parser.add_argument('--persist.reset_fraction', type=float, default=1,
+                        help="fraction of graphs to reset before each batch based on loss")
+    args, _ = parser.parse_known_args()
 
-    # Do graphs share the same trainable base values?
-    'shared_base': False,
+    def fix_nesting(d: dict, key, value):
+        i = key.find('.')
+        if i == -1:
+            d[key] = value
+            return
+        if key[:i] not in d:
+            d[key[:i]] = {}
+        fix_nesting(d[key[:i]], key[i+1:], value)
 
-    'persist': {
-        # epochs to run with persist.fraction=0
-        'epoch_start': 0,
-        # epochs at which to have full persist.fraction
-        'epoch_end': 0,
-        # fraction of graphs to reset before each batch based on loss
-        'reset_fraction': 1.0,
-    }
-}
+    # convert keys with "." in them into a nested dict inside
+    config = {}
+    for k, v in args.__dict__.items():
+        fix_nesting(config, k, v)
 
+    return config
 
 
 # task config
@@ -114,7 +124,7 @@ def process_input(ngraph, emb, decoder, X):
 
 
 def train_epoch(ngraph, base_node, base_edge, emb, decoder,
-                optimizer, criterion, train_data, epoch):
+                optimizer, train_data, epoch):
     indices = list(range(0, train_data.size(1) - 1, BATCH_TOKENS))
     np.random.shuffle(indices)
     bar = tqdm(indices)
@@ -146,10 +156,10 @@ def train_epoch(ngraph, base_node, base_edge, emb, decoder,
 
         pred = process_input(ngraph, emb, decoder, x_data)
 
-        if base_node.abs().max() > 100:
-            print(f'high base_node vals! {base_node.abs().max()}')
-        if base_edge.abs().max() > 100:
-            print(f'high base_edge vals! {base_edge.abs().max()}')
+        #if base_node.abs().max() > 100:
+        #    print(f'high base_node vals! {base_node.abs().max()}')
+        #if base_edge.abs().max() > 100:
+        #    print(f'high base_edge vals! {base_edge.abs().max()}')
         #if ngraph.node_vals.abs().max() > 100:
         #    print(f'high node vals! {ngraph.node_vals.abs().max()}')
         #if ngraph.edge_vals.abs().max() > 100:
@@ -218,7 +228,7 @@ def evaluate(ngraph, base_node, base_edge, emb, decoder, val_data):
 
             pred = process_input(ngraph, emb, decoder, x_data)
 
-            loss = criterion(pred.reshape(-1, VOCAB_SIZE), y_data.reshape(-1))
+            loss = nn.CrossEntropyLoss()(pred.reshape(-1, VOCAB_SIZE), y_data.reshape(-1))
             total_loss += loss.item()
             total_count += 1
             bar.set_postfix({'val_loss': total_loss / total_count})
@@ -248,7 +258,7 @@ def evaluate_learning(ngraph, base_node, base_edge, emb, decoder, learn_data):
                 continue
 
             pred = process_input(ngraph, emb, decoder, x_data)
-            loss = criterion(pred.reshape(-1, VOCAB_SIZE), y_data.reshape(-1))
+            loss = nn.CrossEntropyLoss()(pred.reshape(-1, VOCAB_SIZE), y_data.reshape(-1))
             bar.set_postfix({'learn_val_loss': loss.item()})
             wandb.log({'learn_val_loss': loss.item()})
 
@@ -310,7 +320,8 @@ def evaluate_learning(ngraph, base_node, base_edge, emb, decoder, learn_data):
 
 if __name__ == '__main__':
 
-    run = wandb.init(config=config, project='ngraph')
+    #run = wandb.init(config=config, project='ngraph')
+    run = wandb.init(config=get_config(), project='ngraph')
     print(wandb.config)
 
     lr = wandb.config['lr']
@@ -320,16 +331,14 @@ if __name__ == '__main__':
     ch_v = wandb.config['channels_v']
     ch_e = wandb.config['channels_e']
 
-    # lang = data.Language(LANG_STAGES)
     langs = [data.Language(LANG_STAGES) for _ in range(bs)]
     learn_langs = [data.Language(LANG_STAGES) for _ in range(bs)]
 
     print('generating data...')
-    train_data = generate_batched_data(langs, bs, base_len=1000, progress=True)#.to(DEVICE)
-    test_data = generate_batched_data(langs, bs, base_len=100)#.to(DEVICE)
-    learn_data = generate_batched_data(langs, bs, base_len=100)#.to(DEVICE)
+    train_data = generate_batched_data(langs, bs, base_len=1000, progress=True)
+    test_data = generate_batched_data(langs, bs, base_len=100)
+    learn_data = generate_batched_data(langs, bs, base_len=100)
     print(f'{train_data.shape=}\n{test_data.shape=}')
-    #assert False
 
     message_functions = [
         partial(message_tiny, ch_v, ch_e, zero=wandb.config['message_zero']),
@@ -386,9 +395,6 @@ if __name__ == '__main__':
         params.extend([base_node, base_edge])
 
     optimizer = torch.optim.AdamW(params, lr=lr)
-    #optimizer = torch.optim.Adam(params, lr=lr)
-    #optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9)
-    criterion = nn.CrossEntropyLoss()
 
     for epoch in range(epochs):
         #k = wandb.config['add_node_every']
@@ -407,21 +413,22 @@ if __name__ == '__main__':
         #    ngraph.update.requires_grad_(True)
 
         train_epoch(ngraph, base_node, base_edge, emb, decoder,
-                    optimizer, criterion, train_data, epoch)
+                    optimizer, train_data, epoch)
 
             # assert False
         evaluate(ngraph, base_node, base_edge, emb, decoder, test_data)
         #evaluate_learning(ngraph, base_node, base_edge, emb, decoder, learn_data)
         #torch.save(ngraph.to('cpu'), 'ngraph30_high_ch.pt')
-      #  if (epoch+1) % 5 == 0:
-      #      #torch.save({
-      #      #    'ngraph': ngraph.to('cpu'),
-      #      #    'emb': emb.to('cpu'),
-      #      #    'decoder': decoder.to('cpu'),
-      #      #}, f'learngen20_e{epoch+1}.pt')
-      #      ngraph.to(DEVICE)
-      #      emb.to(DEVICE)
-      #      decoder.to(DEVICE)
+
+        if wandb.config['save_ckpt'] is not None:
+            torch.save({
+                'ngraph': ngraph.to('cpu'),
+                'emb': emb.to('cpu'),
+                'decoder': decoder.to('cpu'),
+            }, wandb.config['save_ckpt'])
+            ngraph.to(DEVICE)
+            emb.to(DEVICE)
+            decoder.to(DEVICE)
 
 
 
