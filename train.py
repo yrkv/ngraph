@@ -16,6 +16,7 @@ import data
 
 
 def get_config():
+    mbool = lambda x: (str(x).lower() in ['true','1', 'yes'])
     parser = argparse.ArgumentParser()
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--word_embed_size', type=int, default=32)
@@ -26,19 +27,25 @@ def get_config():
     parser.add_argument('--node_count', type=int, default=20)
     parser.add_argument('--start_node_a', type=float, default=0.2)
     parser.add_argument('--start_edge_a', type=float, default=0.2)
+
     parser.add_argument('--message_config', type=int, default=1)
-    parser.add_argument('--message_zero', type=bool, default=False)
+    parser.add_argument('--message_zero', type=mbool, default=False)
     parser.add_argument('--update_config', type=int, default=0)
-    parser.add_argument('--update_zero', type=bool, default=False)
-    parser.add_argument('--reset_out_node', type=bool, default=True)
-    parser.add_argument('--step_edges', type=bool, default=True)
+    parser.add_argument('--update_zero', type=mbool, default=False)
+
+    parser.add_argument('--reset_out_node', type=mbool, default=True)
+    parser.add_argument('--step_edges', type=mbool, default=True)
+
     parser.add_argument('--node_dropout_p', type=float, default=0.0)
     parser.add_argument('--edge_dropout_p', type=float, default=0.0)
+
     parser.add_argument('--add_nodes', type=int, default=0)
     parser.add_argument('--add_node_every', type=int, default=1)
+
     parser.add_argument('--load_ckpt', type=str, default=None)
     parser.add_argument('--save_ckpt', type=str, default=None)
-    parser.add_argument('--shared_base', type=bool, default=False,
+
+    parser.add_argument('--shared_base', type=mbool, default=False,
                         help="do graphs share the same trainable base values?")
     parser.add_argument('--persist.epoch_start', type=int, default=0,
                         help="epochs to run with persist.reset_fraction=0")
