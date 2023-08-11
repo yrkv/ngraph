@@ -7,24 +7,28 @@ from tqdm.auto import tqdm
 
 
 class NeuralGraph(nn.Module):
-    def __init__(self, nodes:int, message_function, update_function,
+    def __init__(self, nodes:int, message_function, update_function, attention_function=None,
                  n_input:int=0, n_output:int=0, connections:list=None,
-                 ch_v:int=8, ch_e:int=8, layers:int=5,
+                 ch_v:int=8, ch_e:int=8, ch_k:int=8, layers:int=5,
                  node_dropout_p:float=0.0, edge_dropout_p:float=0.0, 
                  zero_last:bool=False,
                  batchsize:int=4, poolsize:int=None, 
-                 use_update:bool=True, average_messages:bool=True,):
+                 use_update:bool=True, average_messages:bool=True):
         super().__init__()
         
         self.nodes = nodes
         self.n_input, self.n_output = n_input, n_output
         self.batchsize = batchsize
         self.poolsize = poolsize or batchsize
-        self.ch_v, self.ch_e = ch_v, ch_e
+        self.ch_v, self.ch_e, self.ch_k = ch_v, ch_e, ch_k
         self.node_dropout_p, self.edge_dropout_p = node_dropout_p, edge_dropout_p
         self.zero_last = zero_last
         self.message = nn.ModuleList([message_function() for _ in range(layers)])
         self.update = nn.ModuleList([update_function() for _ in range(layers)])
+
+        self.use_attention = True if attention_function else False
+        if attention_function:
+            self.attention = nn.ModuleList([attention_function() for _ in range(layers)])
         # self.message = message or MessageFunction(ch_v=ch_v, ch_e=ch_e)
         # self.update = update or UpdateFunction(ch_v=ch_v)
         self.use_update, self.average_messages = use_update, average_messages
@@ -71,22 +75,36 @@ class NeuralGraph(nn.Module):
         m = self.message[layer](h)
         m_a, m_b, m_ab = torch.split(m, [self.ch_v, self.ch_v, self.ch_e], -1)
         
+        # Use attention to weight messages
+        if self.use_attention:
+            attention = self.attention[layer](self.node_vals)
+            f_keys, f_queries, b_keys, b_queries = torch.split(attention, [self.ch_k,]*4, -1)
+            
+            f_attention = torch.softmax((f_keys[:, self.conn_a] * f_queries[:, self.conn_b]).sum(-1), -1).unsqueeze(-1)
+            b_attention = torch.softmax((b_queries[:, self.conn_a] * b_keys[:, self.conn_b]).sum(-1), -1).unsqueeze(-1)
+
+            m_b = m_b * f_attention
+            m_a = m_a * b_attention
+
         agg_m_a = torch.zeros(self.batchsize, self.nodes, self.ch_v, device=h.device)
         agg_m_b = torch.zeros(self.batchsize, self.nodes, self.ch_v, device=h.device)
 
         agg_m_a.index_add_(1, self.conn_a, m_a)
         agg_m_b.index_add_(1, self.conn_b, m_b)
-            
+
+        # Attention is implicitly an average        
+        if not self.use_attention and self.average_messages:
+            agg_m_a.divide_(self.counts_a[None, :, None])
+            agg_m_b.divide_(self.counts_b[None, :, None])
+        
+
         # Use the vertex update function on aggregated messages
         if self.use_update:
             # Average messages as opposed to summing 
-            if self.average_messages:
-                agg_m_a.divide_(self.counts_a[None, :, None])
-                agg_m_b.divide_(self.counts_b[None, :, None])
-            
             m = torch.cat([agg_m_a, agg_m_b, self.node_vals[self.pool]], axis=2)
             updates = self.update[layer](m)
         
+
         # Use simple average of aggregated messages
         else:
             updates = agg_m_a + agg_m_b
