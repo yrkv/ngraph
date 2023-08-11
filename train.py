@@ -151,7 +151,8 @@ def train_epoch(ngraph, base_node, base_edge, emb, decoder,
         reset.requires_grad_(False)
         
         if wandb.config['shared_base']:
-            base_n, base_e = base_node[:1].expand(32, -1, -1),  base_edge[:1].expand(32, -1, -1)
+            base_n  = base_node[:1].expand(wandb.config['batch_size'], -1, -1)
+            base_e = base_edge[:1].expand(wandb.config['batch_size'], -1, -1)
         else:
             base_n, base_e = base_node, base_edge
             
@@ -207,10 +208,8 @@ def train_epoch(ngraph, base_node, base_edge, emb, decoder,
         bar.set_postfix(entry)
         wandb.log(entry)
 
-    #assert False
 
-
-def evaluate(ngraph, base_node, base_edge, emb, decoder, val_data):
+def evaluate(ngraph, base_node, base_edge, emb, decoder, val_data, log_key='val_loss'):
     with torch.no_grad():
         indices = list(range(0, val_data.size(1) - 1, BATCH_TOKENS))
         np.random.shuffle(indices)
@@ -220,15 +219,15 @@ def evaluate(ngraph, base_node, base_edge, emb, decoder, val_data):
         total_loss = 0
 
         for i in bar:
-            x_data = train_data[:, i:i+BATCH_TOKENS].to(DEVICE)
-            y_data = train_data[:, i+1:i+1+BATCH_TOKENS].to(DEVICE)
+            x_data = val_data[:, i:i+BATCH_TOKENS].to(DEVICE)
+            y_data = val_data[:, i+1:i+1+BATCH_TOKENS].to(DEVICE)
             if x_data.shape != y_data.shape:
                 continue
 
 
             if wandb.config['shared_base']:
-                ngraph.node_vals = base_node[:1].expand(32, -1, -1) + 0.
-                ngraph.edge_vals = base_edge[:1].expand(32, -1, -1) + 0.
+                ngraph.node_vals = base_node[:1].expand(wandb.config['batch_size'], -1, -1) + 0.
+                ngraph.edge_vals = base_edge[:1].expand(wandb.config['batch_size'], -1, -1) + 0.
             else:
                 ngraph.node_vals = base_node + 0.
                 ngraph.edge_vals = base_edge + 0.
@@ -238,19 +237,19 @@ def evaluate(ngraph, base_node, base_edge, emb, decoder, val_data):
             loss = nn.CrossEntropyLoss()(pred.reshape(-1, VOCAB_SIZE), y_data.reshape(-1))
             total_loss += loss.item()
             total_count += 1
-            bar.set_postfix({'val_loss': total_loss / total_count})
+            bar.set_postfix({log_key: total_loss / total_count})
 
-        wandb.log({'val_loss': total_loss / total_count})
+        wandb.log({log_key: total_loss / total_count})
 
 
-def evaluate_learning(ngraph, base_node, base_edge, emb, decoder, learn_data):
+def evaluate_learning(ngraph, base_node, base_edge, emb, decoder, learn_data, log_key='learn_loss'):
     with torch.no_grad():
         node_vals_pre = ngraph.node_vals
         edge_vals_pre = ngraph.edge_vals
 
         if wandb.config['shared_base']:
-            ngraph.node_vals = base_node[:1].expand(32, -1, -1) + 0.
-            ngraph.edge_vals = base_edge[:1].expand(32, -1, -1) + 0.
+            ngraph.node_vals = base_node[:1].expand(wandb.config['batch_size'], -1, -1) + 0.
+            ngraph.edge_vals = base_edge[:1].expand(wandb.config['batch_size'], -1, -1) + 0.
         else:
             ngraph.node_vals = base_node.flip(0)
             ngraph.edge_vals = base_edge.flip(0)
@@ -259,15 +258,15 @@ def evaluate_learning(ngraph, base_node, base_edge, emb, decoder, learn_data):
         np.random.shuffle(indices)
         bar = tqdm(indices)
         for i in bar:
-            x_data = train_data[:, i:i+BATCH_TOKENS].to(DEVICE)
-            y_data = train_data[:, i+1:i+1+BATCH_TOKENS].to(DEVICE)
+            x_data = learn_data[:, i:i+BATCH_TOKENS].to(DEVICE)
+            y_data = learn_data[:, i+1:i+1+BATCH_TOKENS].to(DEVICE)
             if x_data.shape != y_data.shape:
                 continue
 
             pred = process_input(ngraph, emb, decoder, x_data)
             loss = nn.CrossEntropyLoss()(pred.reshape(-1, VOCAB_SIZE), y_data.reshape(-1))
-            bar.set_postfix({'learn_val_loss': loss.item()})
-            wandb.log({'learn_val_loss': loss.item()})
+            bar.set_postfix({log_key: loss.item()})
+            wandb.log({log_key: loss.item()})
 
         ngraph.node_vals = node_vals_pre
         ngraph.edge_vals = edge_vals_pre
@@ -344,7 +343,7 @@ if __name__ == '__main__':
     print('generating data...')
     train_data = generate_batched_data(langs, bs, base_len=1000, progress=True)
     test_data = generate_batched_data(langs, bs, base_len=100)
-    learn_data = generate_batched_data(langs, bs, base_len=100)
+    learn_data = generate_batched_data(learn_langs, bs, base_len=100)
     print(f'{train_data.shape=}\n{test_data.shape=}')
 
     message_functions = [
@@ -376,6 +375,8 @@ if __name__ == '__main__':
     emb = nn.Embedding(VOCAB_SIZE, wandb.config['word_embed_size']).to(DEVICE)
     decoder = nn.Linear(wandb.config['word_embed_size'], VOCAB_SIZE).to(DEVICE)
 
+    # when loading from a checkpoint, ngraph configuration (e.g. node count) is
+    # effectively ignored since the ngaph is loaded directly. 
     if wandb.config['load_ckpt'] is not None:
         loaded = torch.load(wandb.config['load_ckpt'])
 
