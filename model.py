@@ -77,7 +77,7 @@ class NeuralGraph(nn.Module):
         
         # Use attention to weight messages
         if self.use_attention:
-            attention = self.attention[layer](self.node_vals)
+            attention = self.attention[layer](nodes_dropped[self.pool])
             f_keys, f_queries, b_keys, b_queries = torch.split(attention, [self.ch_k,]*4, -1)
             
             f_attention = torch.softmax((f_keys[:, self.conn_a] * f_queries[:, self.conn_b]).sum(-1), -1).unsqueeze(-1)
@@ -92,7 +92,7 @@ class NeuralGraph(nn.Module):
         agg_m_a.index_add_(1, self.conn_a, m_a)
         agg_m_b.index_add_(1, self.conn_b, m_b)
 
-        # Attention is implicitly an average        
+        # Attention is implicitly an average already
         if not self.use_attention and self.average_messages:
             agg_m_a.divide_(self.counts_a[None, :, None])
             agg_m_b.divide_(self.counts_b[None, :, None])

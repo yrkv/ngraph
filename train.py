@@ -332,9 +332,10 @@ def evaluate_learning(ngraph, base_node, base_edge, emb, decoder, learn_data):
 
 
 if __name__ == '__main__':
-
+    torch.autograd.set_detect_anomaly(True)
     #run = wandb.init(config=config, project='ngraph')
     run = wandb.init(config=get_config(), project='ngraph')
+
     print(wandb.config)
 
     lr = wandb.config['lr']
@@ -402,6 +403,7 @@ if __name__ == '__main__':
     if not wandb.config['optimize_model']:
         ngraph.message.requires_grad_(False)
         ngraph.update.requires_grad_(False)
+        ngraph.attention.requires_grad_(False)
 
     base_node = ngraph.node_vals.clone().detach().to(DEVICE)
     base_edge = ngraph.edge_vals.clone().detach().to(DEVICE)
