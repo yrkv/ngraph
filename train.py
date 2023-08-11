@@ -12,6 +12,7 @@ from tqdm.auto import tqdm
 from model import NeuralGraph
 from message import *
 from update import *
+from attention import *
 import data
 
 
@@ -22,6 +23,7 @@ def get_config():
     parser.add_argument('--word_embed_size', type=int, default=32)
     parser.add_argument('--channels_v', type=int, default=64)
     parser.add_argument('--channels_e', type=int, default=64)
+    parser.add_argument('--channels_k', type=int, default=16)
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--node_count', type=int, default=20)
@@ -30,8 +32,12 @@ def get_config():
 
     parser.add_argument('--message_config', type=int, default=1)
     parser.add_argument('--message_zero', type=mbool, default=False)
+
     parser.add_argument('--update_config', type=int, default=0)
     parser.add_argument('--update_zero', type=mbool, default=False)
+
+    parser.add_argument('--attention_config', type=int, default=0)
+    parser.add_argument('--attention_zero', type=mbool, default=False)
 
     parser.add_argument('--reset_out_node', type=mbool, default=True)
     parser.add_argument('--step_edges', type=mbool, default=True)
@@ -325,9 +331,10 @@ def evaluate_learning(ngraph, base_node, base_edge, emb, decoder, learn_data, lo
 
 
 if __name__ == '__main__':
-
+    torch.autograd.set_detect_anomaly(True)
     #run = wandb.init(config=config, project='ngraph')
     run = wandb.init(config=get_config(), project='ngraph')
+
     print(wandb.config)
 
     lr = wandb.config['lr']
@@ -336,6 +343,7 @@ if __name__ == '__main__':
 
     ch_v = wandb.config['channels_v']
     ch_e = wandb.config['channels_e']
+    ch_k = wandb.config['channels_k']
 
     langs = [data.Language(LANG_STAGES) for _ in range(bs)]
     learn_langs = [data.Language(LANG_STAGES) for _ in range(bs)]
@@ -361,8 +369,17 @@ if __name__ == '__main__':
     ]
     update_f = update_functions[wandb.config['update_config']]
 
-    ngraph = NeuralGraph(wandb.config['node_count'], message_f, update_f,
-                         ch_v=ch_v, ch_e=ch_e,
+    attention_functions = [
+        None, # No attention should also be an option
+        partial(attention_tiny, ch_v, ch_k, zero=wandb.config['attention_zero']),
+        partial(attention_tiny_plus, ch_v, ch_k, zero=wandb.config['attention_zero']),
+        partial(attention_small, ch_v, ch_k, 16, zero=wandb.config['attention_zero']),
+        partial(attention_small_plus, ch_v, ch_k, 16, zero=wandb.config['attention_zero']),
+    ]
+    attention_f = attention_functions[wandb.config['attention_config']]
+
+    ngraph = NeuralGraph(wandb.config['node_count'], message_f, update_f, attention_function=attention_f,
+                         ch_v=ch_v, ch_e=ch_e, ch_k=ch_k,
                          node_dropout_p=wandb.config['node_dropout_p'], 
                          edge_dropout_p=wandb.config['edge_dropout_p'], 
                          batchsize=bs,
@@ -387,6 +404,7 @@ if __name__ == '__main__':
     if not wandb.config['optimize_model']:
         ngraph.message.requires_grad_(False)
         ngraph.update.requires_grad_(False)
+        ngraph.attention.requires_grad_(False)
 
     base_node = ngraph.node_vals.clone().detach().to(DEVICE)
     base_edge = ngraph.edge_vals.clone().detach().to(DEVICE)
