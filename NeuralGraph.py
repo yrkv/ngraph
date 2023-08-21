@@ -54,7 +54,7 @@ class Attention(nn.Module):
 
 class NeuralGraph(nn.Module):
     def __init__(self, n_nodes, n_inputs, n_outputs, connections, ch_n=8, ch_e=8, ch_k=8, ch_inp=1, ch_out=1, decay=0, leakage=0,
-                 value_range=[-100, 100], value_init="trainable", set_nodes=False, aggregation="attention", device="cpu", 
+                 value_range=[-100, 100], value_init="trainable", set_nodes=False, aggregation="attention", device="cpu", use_label=True,
                  node_dropout_p=0, edge_dropout_p=0, poolsize=None,
                  n_models=1, message_generator=Message, update_generator=Update, attention_generator=Attention):
         """
@@ -89,6 +89,7 @@ class NeuralGraph(nn.Module):
         :param set_nodes: Instead of adding to a node's current value every timestep, it will set the node.
         :param aggregation: One of [attention, sum, mean].  How to aggregate messages
         :param device: What device to run everything on
+        :param use_label: Whether to be able to input the label to an example into the output nodes of the graph for pseudolearning
         :param node_dropout_p: What percent of node updates to drop to 0
         :param edge_dropout_p: What percent of edge updates to drop to 0
         :param poolsize: Poolsize to use for persistence training (if set to None then no persistence training)
@@ -109,19 +110,22 @@ class NeuralGraph(nn.Module):
         self.n_inputs, self.n_outputs = n_inputs, n_outputs
         self.ch_n, self.ch_e, self.ch_k, self.ch_inp, self.ch_out = ch_n, ch_e, ch_k, ch_inp, ch_out
         self.decay, self.value_range, self.leakage, self.n_models = decay, value_range, leakage, n_models
-        self.value_init, self.set_nodes, self.aggregation = value_init, set_nodes, aggregation
+        self.value_init, self.set_nodes, self.aggregation, self.use_label = value_init, set_nodes, aggregation, use_label
         self.node_dropout_p, self.edge_dropout_p, self.poolsize = node_dropout_p, edge_dropout_p, poolsize
         self.device = device
         self.pool = None
 
         assert self.aggregation in ["attention", "sum", "mean"], f"Unknown aggregation option {self.aggregation}"
 
-        self.ch_extra = self.ch_inp + self.ch_out + 4
+
+        self.ch_extra = self.ch_inp + 3 + (self.ch_out+1 if use_label else 0)
         # extra channels are
         # 0:ch_inp is inp
-        # ch_inp:ch_inp+ch_out is label
 
+        # USED IF use_label SET TO TRUE
+        # ch_inp:ch_inp+ch_out is label
         # -4:hasLabel
+        
         # -3:isInp
         # -2:isHid
         # -1:isOut
@@ -350,12 +354,17 @@ class NeuralGraph(nn.Module):
             inp = torch.tensor(inp, device=self.device)
         if self.ch_inp == 1 and len(inp.shape) != 3:
             inp = inp.unsqueeze(-1)
-        
+
         # Clear out old input and labels and hasLabel
-        self.node_info[indices, :, :self.ch_inp+self.ch_out+1] = 0
+        if self.use_label:
+            self.node_info[indices, -self.n_outputs:, self.ch_inp:self.ch_inp+self.ch_out] = 0
+            self.node_info[indices, :, -4] = 1       
+             
         self.node_info[indices, :self.n_inputs, :self.ch_inp] = inp.clone()
         
         if label is not None:
+            assert self.use_label, "Tried to apply labels but use_label was set to False"
+
             if not type(label) == torch.Tensor:
                 label = torch.tensor(label, device=self.device)
             if self.ch_out == 1 and len(label.shape) != 3:
