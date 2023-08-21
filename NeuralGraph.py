@@ -94,12 +94,12 @@ class NeuralGraph(nn.Module):
         :param poolsize: Poolsize to use for persistence training (if set to None then no persistence training)
 
         :param n_models: Number of models to cycle through
-        :param message_generator: Function to generate message models.  Must have very specific shape of
-            input_shape=((ch_n + (ch_inp + ch_out + 4))*2 + ch_e) and output_shape=(ch_n*2 + ch_e)
-        :param update_generator: Function to generate update models.  Must have very specific shape of
-            input_shape=(ch_n*3 + ch_inp + ch_out + 4) and output_shape=(ch_n)
-        :param attention_generator: Function to generate attention models.  Must have very specific shape of
-            input_shape=(ch_n + ch_inp + ch_out + 4) and output_shape=(ch_k*4)
+        :param message_generator: Function to generate message models.  Must take as input ch_n, ch_e and ch_extra and have very 
+            specific shape of input_shape=((ch_n + ch_extra)*2 + ch_e) and output_shape=(ch_n*2 + ch_e)
+        :param update_generator: Function to generate update models.  Must take as input ch_n and ch_extra and have very 
+            specific shape of input_shape=(ch_n*3 + ch_extra) and output_shape=(ch_n)
+        :param attention_generator: Function to generate attention models.  Must take as input ch_n, ch_k and ch_extra and have very 
+            specific shape of input_shape=(ch_n + ch_extra) and output_shape=(ch_k*4)
         """
         super().__init__()
         
