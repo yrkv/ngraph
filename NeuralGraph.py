@@ -54,7 +54,7 @@ class Attention(nn.Module):
 
 class NeuralGraph(nn.Module):
     def __init__(self, n_nodes, n_inputs, n_outputs, connections, ch_n=8, ch_e=8, ch_k=8, ch_inp=1, ch_out=1, decay=0, leakage=0,
-                 value_range=[-100, 100], value_init="trainable", set_nodes=False, use_attention=True, device="cpu", 
+                 value_range=[-100, 100], value_init="trainable", set_nodes=False, aggregation="attention", device="cpu", 
                  node_dropout_p=0, edge_dropout_p=0, poolsize=None,
                  n_models=1, message_generator=Message, update_generator=Update, attention_generator=Attention):
         """
@@ -68,8 +68,8 @@ class NeuralGraph(nn.Module):
 
 
         :param n_nodes: Total number of nodes in the graph
-        :param n_inputs: Number of input nodes in the graph (indeces 0:n_inputs)
-        :param n_outputs: Number of output nodes in the graph (indeces -n_ouputs:-1)
+        :param n_inputs: Number of input nodes in the graph (indices 0:n_inputs)
+        :param n_outputs: Number of output nodes in the graph (indices -n_ouputs:-1)
         :param connections: List of connections of nodes e.g. [(0, 1), (1, 2), ... (0, 2)]
         
         :param ch_n: Number of channels for each node
@@ -85,9 +85,9 @@ class NeuralGraph(nn.Module):
             nodeA = (1-leakage) * nodeA + leakage * avg_connect_node
         :param value_range: The range that node and edge values can take.  Anything above 
             or below will be clamped to this range
-        :param value_init: One of [trainable, random, zeros].  Decides how to initialize node and edges
+        :param value_init: One of [trainable, trainable_batch, random, zeros].  Decides how to initialize node and edges
         :param set_nodes: Instead of adding to a node's current value every timestep, it will set the node.
-        :param use_attention: Whether to use attention or not
+        :param aggregation: One of [attention, sum, mean].  How to aggregate messages
         :param device: What device to run everything on
         :param node_dropout_p: What percent of node updates to drop to 0
         :param edge_dropout_p: What percent of edge updates to drop to 0
@@ -109,10 +109,12 @@ class NeuralGraph(nn.Module):
         self.n_inputs, self.n_outputs = n_inputs, n_outputs
         self.ch_n, self.ch_e, self.ch_k, self.ch_inp, self.ch_out = ch_n, ch_e, ch_k, ch_inp, ch_out
         self.decay, self.value_range, self.leakage, self.n_models = decay, value_range, leakage, n_models
-        self.value_init, self.set_nodes, self.use_attention = value_init, set_nodes, use_attention
+        self.value_init, self.set_nodes, self.aggregation = value_init, set_nodes, aggregation
         self.node_dropout_p, self.edge_dropout_p, self.poolsize = node_dropout_p, edge_dropout_p, poolsize
         self.device = device
         self.pool = None
+
+        assert self.aggregation in ["attention", "sum", "mean"], f"Unknown aggregation option {self.aggregation}"
 
         self.ch_extra = self.ch_inp + self.ch_out + 4
         # extra channels are
@@ -125,9 +127,9 @@ class NeuralGraph(nn.Module):
         # -1:isOut
         
         if self.value_init == "trainable":
-            self.register_parameter("init_nodes", nn.Parameter(torch.randn(self.n_nodes, self.ch_n, device=self.device)))
-            self.register_parameter("init_edges", nn.Parameter(torch.randn(self.n_edges, self.ch_e, device=self.device)))
-        
+            self.register_parameter("init_nodes", nn.Parameter(torch.randn(self.n_nodes, self.ch_n, device=self.device), requires_grad=True))
+            self.register_parameter("init_edges", nn.Parameter(torch.randn(self.n_edges, self.ch_e, device=self.device), requires_grad=True))
+
         self.register_buffer('nodes', torch.zeros(1, self.n_nodes, self.ch_n, device=self.device), persistent=False)
         self.register_buffer('node_info', torch.zeros(1, self.n_nodes, self.ch_extra, device=self.device), persistent=False)
         self.register_buffer('edges', torch.zeros(1, self.n_edges, self.ch_e, device=self.device), persistent=False)
@@ -167,16 +169,16 @@ class NeuralGraph(nn.Module):
 
         assert self.pool is not None or self.poolsize is None, "No pool selected but poolsize > 0"
 
-        indeces = self.pool if self.pool is not None else np.arange(len(self.nodes))
+        indices = self.pool if self.pool is not None else np.arange(len(self.nodes))
 
         # Get messages
-        node_data = torch.cat([self.node_info[indeces], self.nodes[indeces]], axis=2)
-        m_x = torch.cat([node_data[:, self.conn_a], node_data[:, self.conn_b], self.edges[indeces]], dim=2)
+        node_data = torch.cat([self.node_info[indices], self.nodes[indices]], axis=2)
+        m_x = torch.cat([node_data[:, self.conn_a], node_data[:, self.conn_b], self.edges[indices]], dim=2)
         m = self.messages[t % self.n_models](m_x)
         
         m_a, m_b, m_ab = torch.split(m, [self.ch_n, self.ch_n, self.ch_e], 2)
         
-        if self.use_attention:
+        if self.aggregation == "attention":
             attention = self.attentions[t % self.n_models](node_data)
             f_keys, f_queries, b_keys, b_queries = torch.split(attention, [self.ch_k,]*4, -1)
             
@@ -185,12 +187,17 @@ class NeuralGraph(nn.Module):
             
             m_b = m_b * f_attention
             m_a = m_a * b_attention
+
         
         # Aggregate messages (summing up for now.  Could make it average instead)
-        agg_m_a = torch.zeros(len(indeces), self.n_nodes, self.ch_n, device=self.device)
-        agg_m_b = torch.zeros(len(indeces), self.n_nodes, self.ch_n, device=self.device)
+        agg_m_a = torch.zeros(len(indices), self.n_nodes, self.ch_n, device=self.device)
+        agg_m_b = torch.zeros(len(indices), self.n_nodes, self.ch_n, device=self.device)
         agg_m_a.index_add_(1, self.conn_a, m_a)
         agg_m_b.index_add_(1, self.conn_b, m_b)
+
+        if self.aggregation == "mean":
+            agg_m_a.divide_(self.counts_a[None, :, None])
+            agg_m_b.divide_(self.counts_b[None, :, None])
         
         # Get updates
         u_x = torch.cat([agg_m_a, agg_m_b, node_data], axis=2)
@@ -201,9 +208,9 @@ class NeuralGraph(nn.Module):
         masked_m_ab = m_ab * torch.where(torch.rand_like(m_a) < self.edge_dropout_p, 0, 1)
 
         # Calculate leakage for each node
-        agg_leakage = torch.zeros(len(indeces), self.n_nodes, self.ch_n, device=self.device)
-        agg_leakage.index_add_(1, self.conn_a, self.nodes[indeces][:, self.conn_b])
-        agg_leakage.index_add_(1, self.conn_b, self.nodes[indeces][:, self.conn_a])
+        agg_leakage = torch.zeros(len(indices), self.n_nodes, self.ch_n, device=self.device)
+        agg_leakage.index_add_(1, self.conn_a, self.nodes[indices][:, self.conn_b])
+        agg_leakage.index_add_(1, self.conn_b, self.nodes[indices][:, self.conn_a])
         agg_leakage.divide_(torch.repeat_interleave((self.counts_a+self.counts_b).unsqueeze(1), self.ch_n, 1))
 
 
@@ -212,17 +219,17 @@ class NeuralGraph(nn.Module):
             if self.set_nodes:
                 # Just set the nodes instead of adding to them
                 # Ignores dt
-                self.nodes[indeces] = ((1-self.leakage)*(1-self.decay)*masked_update+self.leakage*agg_leakage).clamp(*self.value_range)
+                self.nodes[indices] = ((1-self.leakage)*(1-self.decay)*masked_update+self.leakage*agg_leakage).clamp(*self.value_range)
             else:
                 # Node values get decayed and leaked into
 
                 # Decay node state and add update
-                new_node_state = self.nodes[indeces] * ((1-self.decay)**dt) + masked_update*dt
+                new_node_state = self.nodes[indices] * ((1-self.decay)**dt) + masked_update*dt
                 # Leak in other connected node states and clamp
-                self.nodes[indeces] = ((1-self.leakage)*new_node_state+self.leakage*agg_leakage).clamp(*self.value_range)
+                self.nodes[indices] = ((1-self.leakage)*new_node_state+self.leakage*agg_leakage).clamp(*self.value_range)
 
         if edges:
-            self.edges[indeces] = (self.edges[indeces] + masked_m_ab).clamp(*self.value_range)
+            self.edges[indices] = (self.edges[indices] + masked_m_ab).clamp(*self.value_range)
         
     def init_vals(self, nodes=True, edges=True, batch_size=1):
         """
@@ -240,6 +247,11 @@ class NeuralGraph(nn.Module):
             
             if self.value_init == "trainable":
                 self.nodes = torch.repeat_interleave((self.init_nodes).clone().unsqueeze(0), batch_size, 0)
+            elif self.value_init == "trainable_batch":
+                if not hasattr(self, "init_nodes"):
+                    self.register_parameter("init_nodes", nn.Parameter(torch.randn(batch_size, self.n_nodes, self.ch_n, device=self.device), requires_grad=True))
+                assert self.init_nodes.shape[0] == batch_size, "trainable_batch is on but batch size changed"
+                self.nodes = self.init_nodes.clone()
             elif self.value_init == "random":
                 self.nodes = torch.randn(batch_size, self.n_nodes, self.ch_n, device=self.device) * .01
             elif self.value_init == "zeros":
@@ -250,6 +262,11 @@ class NeuralGraph(nn.Module):
         if edges:
             if self.value_init == "trainable":
                 self.edges = torch.repeat_interleave((self.init_edges).clone().unsqueeze(0), batch_size, 0)
+            elif self.value_init == "trainable_batch":
+                if not hasattr(self, "init_edges"):
+                    self.register_parameter("init_edges", nn.Parameter(torch.randn(batch_size, self.n_edges, self.ch_e, device=self.device), requires_grad=True))
+                assert self.init_edges.shape[0] == batch_size, "trainable_batch is on but batch size changed"
+                self.edges = self.init_edges.clone()
             elif self.value_init == "random":
                 self.edges = torch.randn(batch_size, self.n_edges, self.ch_e, device=self.device) * .01
             elif self.value_init == "zeros":
@@ -258,29 +275,34 @@ class NeuralGraph(nn.Module):
                 raise RuntimeError(f"Unknown initial value config {self.value_init}")
     
     # Reset just one index
-    def reset_vals(self, indeces=None, nodes=True, edges=True):
-        indeces = indeces or np.arange(len(self.nodes))
+    def reset_vals(self, indices=None, nodes=True, edges=True):
+        indices = indices or np.arange(len(self.nodes))
         """
         Reset certain values in pool (or whole batch)
-        :param indeces: Indeces in the pool (or batch) to reset
+        :param indices: indices in the pool (or batch) to reset
         :param nodes: Whether to reset nodes
         :param edges: Whether to reset edges
         """
         if self.value_init == "trainable":
             if nodes:
-                self.nodes[indeces] = torch.repeat_interleave(self.init_nodes.clone().unsqueeze(0), len(indeces), 0)
+                self.nodes[indices] = torch.repeat_interleave(self.init_nodes.clone().unsqueeze(0), len(indices), 0)
             if edges:
-                self.edges[indeces] = torch.repeat_interleave(self.init_edges.clone().unsqueeze(0), len(indeces), 0)
+                self.edges[indices] = torch.repeat_interleave(self.init_edges.clone().unsqueeze(0), len(indices), 0)
+        elif self.value_init == "trainable_batch":
+            if nodes:
+                self.nodes[indices] = self.init_nodes[indices].clone()
+            if edges:
+                self.edges[indices] = self.init_edges[indices].clone()  
         elif self.value_init == "random":
             if nodes:
-                self.nodes[indeces] = torch.randn(len(indeces), self.n_nodes, self.ch_n, device=self.device)
+                self.nodes[indices] = torch.randn(len(indices), self.n_nodes, self.ch_n, device=self.device) * .01
             if edges:
-                self.edges[indeces] = torch.randn(len(indeces), self.n_edges, self.ch_e, device=self.device)
+                self.edges[indices] = torch.randn(len(indices), self.n_edges, self.ch_e, device=self.device) * .01
         elif self.value_init == "zeros":
             if nodes:
-                self.nodes[indeces] = torch.zeros(len(indeces), self.n_nodes, self.ch_n, device=self.device)
+                self.nodes[indices] = torch.zeros(len(indices), self.n_nodes, self.ch_n, device=self.device)
             if edges:
-                self.edges[indeces] = torch.zeros(len(indeces), self.n_edges, self.ch_e, device=self.device)
+                self.edges[indices] = torch.zeros(len(indices), self.n_edges, self.ch_e, device=self.device)
         else:
             raise RuntimeError(f"Unknown initial value config {self.value_init}")
 
@@ -302,7 +324,7 @@ class NeuralGraph(nn.Module):
         if explosion_threshold:
             for i in self.pool:
                 if (self.nodes[i].abs().mean() + self.edges[i].abs().mean()) / 2 > explosion_threshold:
-                    self.reset_vals(indeces=np.array([i]))
+                    self.reset_vals(indices=np.array([i]))
 
         # Reset either one random graph or the graph with the highest loss if provided with losses
         if reset:
@@ -310,7 +332,7 @@ class NeuralGraph(nn.Module):
                 i = self.pool[np.argmax(losses)]
             else:
                 i = np.random.randint(self.poolsize)
-            self.reset_vals(indeces=([i]))
+            self.reset_vals(indices=([i]))
 
     def apply_vals(self, inp, label=None):
         """
@@ -322,7 +344,7 @@ class NeuralGraph(nn.Module):
         """
 
         assert self.pool is not None or self.poolsize is None, "No pool selected but poolsize was not None"
-        indeces = self.pool if self.pool is not None else np.arange(len(self.nodes))
+        indices = self.pool if self.pool is not None else np.arange(len(self.nodes))
 
         if not type(inp) == torch.Tensor:
             inp = torch.tensor(inp, device=self.device)
@@ -330,8 +352,8 @@ class NeuralGraph(nn.Module):
             inp = inp.unsqueeze(-1)
         
         # Clear out old input and labels and hasLabel
-        self.node_info[indeces, :, :self.ch_inp+self.ch_out+1] = 0
-        self.node_info[indeces, :self.n_inputs, :self.ch_inp] = inp.clone()
+        self.node_info[indices, :, :self.ch_inp+self.ch_out+1] = 0
+        self.node_info[indices, :self.n_inputs, :self.ch_inp] = inp.clone()
         
         if label is not None:
             if not type(label) == torch.Tensor:
@@ -340,8 +362,8 @@ class NeuralGraph(nn.Module):
                 label = label.unsqueeze(-1)
             
             # hasLabel = 1
-            self.node_info[indeces, -self.n_outputs:, self.ch_inp:self.ch_inp+self.ch_out] = label.clone()
-            self.node_info[indeces, :, -4] = 1
+            self.node_info[indices, -self.n_outputs:, self.ch_inp:self.ch_inp+self.ch_out] = label.clone()
+            self.node_info[indices, :, -4] = 1
             
     def read_outputs(self):
         """
@@ -349,11 +371,11 @@ class NeuralGraph(nn.Module):
         :return: outputs of shape (batch_size, n_outputs, ch_out) unless ch_out == 1 then (batch_size, n_outputs)
         """
         assert self.pool is not None or self.poolsize is None, "No pool selected but poolsize > 0"
-        indeces = self.pool if self.pool is not None else np.arange(len(self.nodes))
+        indices = self.pool if self.pool is not None else np.arange(len(self.nodes))
 
         if self.ch_out == 1:
-            return self.nodes[indeces, -self.n_outputs:, 0].clone()
-        return self.nodes[indeces, -self.n_outputs:, :self.ch_out].clone()
+            return self.nodes[indices, -self.n_outputs:, 0].clone()
+        return self.nodes[indices, -self.n_outputs:, :self.ch_out].clone()
     
     def overflow(self, k=5):
         """
@@ -362,10 +384,10 @@ class NeuralGraph(nn.Module):
         """
 
         assert self.pool is not None or self.poolsize is None, "No pool selected but poolsize > 0"
-        indeces = self.pool if self.pool is not None else np.arange(len(self.nodes))
+        indices = self.pool if self.pool is not None else np.arange(len(self.nodes))
 
-        node_overflow = ((self.nodes[indeces] - self.nodes[indeces].clamp(-k, k))**2).mean()
-        edge_overflow = ((self.edges[indeces] - self.edges[indeces].clamp(-k, k))**2).mean()
+        node_overflow = ((self.nodes[indices] - self.nodes[indices].clamp(-k, k))**2).mean()
+        edge_overflow = ((self.edges[indices] - self.edges[indices].clamp(-k, k))**2).mean()
         return node_overflow + edge_overflow
         
     def forward(self, x, time=5, dt=1, nodes=True, edges=False):
@@ -423,7 +445,7 @@ class NeuralGraph(nn.Module):
         preds = []
         for i in range(X.shape[1]):
             if reset_nodes:
-                self.reset_vals(indeces=self.pool, nodes=True, edges=False)
+                self.reset_vals(indices=self.pool, nodes=True, edges=False)
 
             preds.append(self.forward(X[:, i], dt=dt, time=time))
         return torch.stack(preds, axis=1)
@@ -444,7 +466,7 @@ class NeuralGraph(nn.Module):
 
         for i in range(X.shape[1]):
             if reset_nodes:
-                self.reset_vals(indeces=self.pool, nodes=True, edges=False)
+                self.reset_vals(indices=self.pool, nodes=True, edges=False)
 
             self.forward(X[:, i], dt=dt, time=time)
             self.backward(X[:, i], Y[:, i], dt=dt, time=time)
