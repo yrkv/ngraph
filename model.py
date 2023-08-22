@@ -11,6 +11,7 @@ class NeuralGraph(nn.Module):
                  n_input:int=0, n_output:int=0, connections:list=None,
                  ch_v:int=8, ch_e:int=8, ch_k:int=8, layers:int=5,
                  node_dropout_p:float=0.0, edge_dropout_p:float=0.0, 
+                 leakage=0.0,
                  zero_last:bool=False,
                  batchsize:int=4, poolsize:int=None, 
                  use_update:bool=True, average_messages:bool=True):
@@ -25,6 +26,8 @@ class NeuralGraph(nn.Module):
         self.zero_last = zero_last
         self.message = nn.ModuleList([message_function() for _ in range(layers)])
         self.update = nn.ModuleList([update_function() for _ in range(layers)])
+        
+        self.leakage = leakage
 
         self.use_attention = True if attention_function else False
         if attention_function:
@@ -104,14 +107,27 @@ class NeuralGraph(nn.Module):
             m = torch.cat([agg_m_a, agg_m_b, self.node_vals[self.pool]], axis=2)
             updates = self.update[layer](m)
         
-
         # Use simple average of aggregated messages
         else:
             updates = agg_m_a + agg_m_b
             if self.average_messages:
                 updates.divide_(self.counts_ab[None, :, None])
+        
+        if self.leakage != 0.0:
+            agg_leakage = torch.zeros_like(self.node_vals)
+            # agg_leakage.index_add_(1, self.conn_b, self.nodes[:, self.conn_a])
+            # agg_leakage.divide_(torch.repeat_interleave((self.counts_b).unsqueeze(1), self.ch_n, 1))
+
+            agg_leakage.index_add_(1, self.conn_a, self.node_vals[:, self.conn_b])
+            agg_leakage.index_add_(1, self.conn_b, self.node_vals[:, self.conn_a])
+            agg_leakage.divide_(torch.repeat_interleave((self.counts_a+self.counts_b).unsqueeze(1), self.ch_v, 1))
             
-        if nodes: self.node_vals[self.pool] += updates
+            
+        if nodes:
+            if self.leakage != 0.0: 
+                self.node_vals[self.pool] += (1-self.leakage)*(updates+self.node_vals[self.pool])+self.leakage*agg_leakage-self.node_vals[self.pool]
+            else:
+                self.node_vals[self.pool] += updates
         if edges: self.edge_vals[self.pool] += m_ab
         
         
