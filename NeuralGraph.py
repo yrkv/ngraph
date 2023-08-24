@@ -186,11 +186,25 @@ class NeuralGraph(nn.Module):
             attention = self.attentions[t % self.n_models](node_data)
             f_keys, f_queries, b_keys, b_queries = torch.split(attention, [self.ch_k,]*4, -1)
             
-            f_attention = torch.softmax((f_keys[:, self.conn_a] * f_queries[:, self.conn_b]).sum(-1), -1).unsqueeze(-1)
-            b_attention = torch.softmax((b_queries[:, self.conn_a] * b_keys[:, self.conn_b]).sum(-1), -1).unsqueeze(-1)
+            # Unnormalized attention weights
+            f_ws = torch.exp((f_keys[:, self.conn_a] * f_queries[:, self.conn_b]).sum(-1))
+            b_ws = torch.exp((b_queries[:, self.conn_a] * b_keys[:, self.conn_b]).sum(-1))
+
+            f_w_agg = torch.zeros(len(indices), self.n_nodes, device=self.device)
+            b_w_agg = torch.zeros(len(indices), self.n_nodes, device=self.device)
+
+            f_w_agg.index_add_(1, self.conn_b, f_ws)
+            b_w_agg.index_add_(1, self.conn_a, b_ws)
+
+            f_attention = f_ws / f_w_agg[:, self.conn_b]
+            b_attention = b_ws / b_w_agg[:, self.conn_a]
+
+            # This is faulty attention.  Softmax over all nodes and not just incoming / outgoing nodes
+            # f_attention = torch.softmax((f_keys[:, self.conn_a] * f_queries[:, self.conn_b]).sum(-1), -1).unsqueeze(-1)
+            # b_attention = torch.softmax((b_queries[:, self.conn_a] * b_keys[:, self.conn_b]).sum(-1), -1).unsqueeze(-1)
             
-            m_b = m_b * f_attention
-            m_a = m_a * b_attention
+            m_b = m_b * torch.repeat_interleave(f_attention.unsqueeze(-1), self.ch_n, -1)
+            m_a = m_a * torch.repeat_interleave(b_attention.unsqueeze(-1), self.ch_n, -1)
 
         
         # Aggregate messages (summing up for now.  Could make it average instead)
