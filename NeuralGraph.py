@@ -131,8 +131,8 @@ class NeuralGraph(nn.Module):
         # -1:isOut
         
         if self.value_init == "trainable":
-            self.register_parameter("init_nodes", nn.Parameter(torch.randn(self.n_nodes, self.ch_n, device=self.device), requires_grad=True))
-            self.register_parameter("init_edges", nn.Parameter(torch.randn(self.n_edges, self.ch_e, device=self.device), requires_grad=True))
+            self.register_parameter("init_nodes", nn.Parameter(torch.randn(self.n_nodes, self.ch_n, device=self.device) * .1, requires_grad=True))
+            self.register_parameter("init_edges", nn.Parameter(torch.randn(self.n_edges, self.ch_e, device=self.device) * .1, requires_grad=True))
 
         self.register_buffer('nodes', torch.zeros(1, self.n_nodes, self.ch_n, device=self.device), persistent=False)
         self.register_buffer('node_info', torch.zeros(1, self.n_nodes, self.ch_extra, device=self.device), persistent=False)
@@ -186,9 +186,17 @@ class NeuralGraph(nn.Module):
             attention = self.attentions[t % self.n_models](node_data)
             f_keys, f_queries, b_keys, b_queries = torch.split(attention, [self.ch_k,]*4, -1)
             
+            
+            f = (f_keys[:, self.conn_a] * f_queries[:, self.conn_b]).sum(-1)
+            b = (b_queries[:, self.conn_a] * b_keys[:, self.conn_b]).sum(-1)
+
             # Unnormalized attention weights
-            f_ws = torch.exp((f_keys[:, self.conn_a] * f_queries[:, self.conn_b]).sum(-1))
-            b_ws = torch.exp((b_queries[:, self.conn_a] * b_keys[:, self.conn_b]).sum(-1))
+            with torch.no_grad():
+                f_max = f.max()
+                b_max = b.max()
+
+            f_ws = torch.exp(f-f_max)
+            b_ws = torch.exp(b-b_max)
 
             f_w_agg = torch.zeros(len(indices), self.n_nodes, device=self.device)
             b_w_agg = torch.zeros(len(indices), self.n_nodes, device=self.device)
