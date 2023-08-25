@@ -54,8 +54,8 @@ class Attention(nn.Module):
 
 class NeuralGraph(nn.Module):
     def __init__(self, n_nodes, n_inputs, n_outputs, connections, ch_n=8, ch_e=8, ch_k=8, ch_inp=1, ch_out=1, decay=0, leakage=0,
-                 value_range=[-100, 100], value_init="trainable", set_nodes=False, aggregation="attention", device="cpu", use_label=True,
-                 node_dropout_p=0, edge_dropout_p=0, poolsize=None,
+                 value_range=[-100, 100], value_init="trainable", init_value_std=1, set_nodes=False, aggregation="attention", device="cpu", 
+                 use_label=True, node_dropout_p=0, edge_dropout_p=0, poolsize=None,
                  n_models=1, message_generator=Message, update_generator=Update, attention_generator=Attention):
         """
         Creates a Neural Graph.  A Neural Graph is an arbitrary directed graph which has input nodes and output nodes.  
@@ -85,7 +85,10 @@ class NeuralGraph(nn.Module):
             nodeA = (1-leakage) * nodeA + leakage * avg_connect_node
         :param value_range: The range that node and edge values can take.  Anything above 
             or below will be clamped to this range
-        :param value_init: One of [trainable, trainable_batch, random, zeros].  Decides how to initialize node and edges
+        :param value_init: One of [trainable, trainable_batch, random, zeros].  Decides how to initialize node and edges.  
+            If using trainable_batch make sure to call graph.init_vals(batch_size=___) BEFORE making an optimizer with graph.parameters().
+            Otherwise the initial values will not be registered or trained.
+        :param init_value_std: Standard deviation of initial values
         :param set_nodes: Instead of adding to a node's current value every timestep, it will set the node.
         :param aggregation: One of [attention, sum, mean].  How to aggregate messages
         :param device: What device to run everything on
@@ -111,6 +114,7 @@ class NeuralGraph(nn.Module):
         self.ch_n, self.ch_e, self.ch_k, self.ch_inp, self.ch_out = ch_n, ch_e, ch_k, ch_inp, ch_out
         self.decay, self.value_range, self.leakage, self.n_models = decay, value_range, leakage, n_models
         self.value_init, self.set_nodes, self.aggregation, self.use_label = value_init, set_nodes, aggregation, use_label
+        self.init_value_std = init_value_std
         self.node_dropout_p, self.edge_dropout_p, self.poolsize = node_dropout_p, edge_dropout_p, poolsize
         self.device = device
         self.pool = None
@@ -131,8 +135,8 @@ class NeuralGraph(nn.Module):
         # -1:isOut
         
         if self.value_init == "trainable":
-            self.register_parameter("init_nodes", nn.Parameter(torch.randn(self.n_nodes, self.ch_n, device=self.device) * .1, requires_grad=True))
-            self.register_parameter("init_edges", nn.Parameter(torch.randn(self.n_edges, self.ch_e, device=self.device) * .1, requires_grad=True))
+            self.register_parameter("init_nodes", nn.Parameter(torch.randn(self.n_nodes, self.ch_n, device=self.device) * self.init_value_std, requires_grad=True))
+            self.register_parameter("init_edges", nn.Parameter(torch.randn(self.n_edges, self.ch_e, device=self.device) * self.init_value_std, requires_grad=True))
 
         self.register_buffer('nodes', torch.zeros(1, self.n_nodes, self.ch_n, device=self.device), persistent=False)
         self.register_buffer('node_info', torch.zeros(1, self.n_nodes, self.ch_extra, device=self.device), persistent=False)
@@ -190,13 +194,11 @@ class NeuralGraph(nn.Module):
             f = (f_keys[:, self.conn_a] * f_queries[:, self.conn_b]).sum(-1)
             b = (b_queries[:, self.conn_a] * b_keys[:, self.conn_b]).sum(-1)
 
-            # Unnormalized attention weights
-            with torch.no_grad():
-                f_max = f.max()
-                b_max = b.max()
+            # Very hard to get max trick working with this implementation of softmax
+            # Therefore we will just do a soft clamp with tanh to ensure no value gets too big
 
-            f_ws = torch.exp(f-f_max)
-            b_ws = torch.exp(b-b_max)
+            f_ws = torch.exp(10*torch.tanh(f/10))
+            b_ws = torch.exp(10*torch.tanh(b/10))
 
             f_w_agg = torch.zeros(len(indices), self.n_nodes, device=self.device)
             b_w_agg = torch.zeros(len(indices), self.n_nodes, device=self.device)
@@ -207,10 +209,6 @@ class NeuralGraph(nn.Module):
             f_attention = f_ws / f_w_agg[:, self.conn_b]
             b_attention = b_ws / b_w_agg[:, self.conn_a]
 
-            # This is faulty attention.  Softmax over all nodes and not just incoming / outgoing nodes
-            # f_attention = torch.softmax((f_keys[:, self.conn_a] * f_queries[:, self.conn_b]).sum(-1), -1).unsqueeze(-1)
-            # b_attention = torch.softmax((b_queries[:, self.conn_a] * b_keys[:, self.conn_b]).sum(-1), -1).unsqueeze(-1)
-            
             m_b = m_b * torch.repeat_interleave(f_attention.unsqueeze(-1), self.ch_n, -1)
             m_a = m_a * torch.repeat_interleave(b_attention.unsqueeze(-1), self.ch_n, -1)
 
@@ -275,11 +273,11 @@ class NeuralGraph(nn.Module):
                 self.nodes = torch.repeat_interleave((self.init_nodes).clone().unsqueeze(0), batch_size, 0)
             elif self.value_init == "trainable_batch":
                 if not hasattr(self, "init_nodes"):
-                    self.register_parameter("init_nodes", nn.Parameter(torch.randn(batch_size, self.n_nodes, self.ch_n, device=self.device), requires_grad=True))
+                    self.register_parameter("init_nodes", nn.Parameter(torch.randn(batch_size, self.n_nodes, self.ch_n, device=self.device) * self.init_value_std, requires_grad=True))
                 assert self.init_nodes.shape[0] == batch_size, "trainable_batch is on but batch size changed"
                 self.nodes = self.init_nodes.clone()
             elif self.value_init == "random":
-                self.nodes = torch.randn(batch_size, self.n_nodes, self.ch_n, device=self.device) * .01
+                self.nodes = torch.randn(batch_size, self.n_nodes, self.ch_n, device=self.device) * self.init_value_std
             elif self.value_init == "zeros":
                 self.nodes = torch.zeros(batch_size, self.n_nodes, self.ch_n, device=self.device)
             else:
@@ -290,11 +288,11 @@ class NeuralGraph(nn.Module):
                 self.edges = torch.repeat_interleave((self.init_edges).clone().unsqueeze(0), batch_size, 0)
             elif self.value_init == "trainable_batch":
                 if not hasattr(self, "init_edges"):
-                    self.register_parameter("init_edges", nn.Parameter(torch.randn(batch_size, self.n_edges, self.ch_e, device=self.device), requires_grad=True))
+                    self.register_parameter("init_edges", nn.Parameter(torch.randn(batch_size, self.n_edges, self.ch_e, device=self.device) * self.init_value_std, requires_grad=True))
                 assert self.init_edges.shape[0] == batch_size, "trainable_batch is on but batch size changed"
                 self.edges = self.init_edges.clone()
             elif self.value_init == "random":
-                self.edges = torch.randn(batch_size, self.n_edges, self.ch_e, device=self.device) * .01
+                self.edges = torch.randn(batch_size, self.n_edges, self.ch_e, device=self.device) * self.init_value_std
             elif self.value_init == "zeros":
                 self.edges = torch.zeros(batch_size, self.n_edges, self.ch_e, device=self.device)
             else:
@@ -321,9 +319,9 @@ class NeuralGraph(nn.Module):
                 self.edges[indices] = self.init_edges[indices].clone()  
         elif self.value_init == "random":
             if nodes:
-                self.nodes[indices] = torch.randn(len(indices), self.n_nodes, self.ch_n, device=self.device) * .01
+                self.nodes[indices] = torch.randn(len(indices), self.n_nodes, self.ch_n, device=self.device) * self.init_value_std
             if edges:
-                self.edges[indices] = torch.randn(len(indices), self.n_edges, self.ch_e, device=self.device) * .01
+                self.edges[indices] = torch.randn(len(indices), self.n_edges, self.ch_e, device=self.device) * self.init_value_std
         elif self.value_init == "zeros":
             if nodes:
                 self.nodes[indices] = torch.zeros(len(indices), self.n_nodes, self.ch_n, device=self.device)
