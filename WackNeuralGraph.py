@@ -3,13 +3,52 @@ import torch.nn as nn
 import numpy as np
 import networkx as nx
 
-# Function that takes in a pair of nodes (with their info) and edge and outputs a message for each
-class Message(nn.Module):
-    def __init__(self, ch_n:int=8, ch_e:int=8, ch_extra:int=6):
+class InputIntegrator(nn.Module):
+    def __init__(self, ch_inp:int=8, ch_n:int=8):
         super().__init__()
 
         self.main = nn.Sequential(
-            nn.Linear((ch_n+ch_extra)*2 + ch_e, 64),
+            nn.Linear(ch_inp+ch_n, 32),
+            nn.SiLU(),
+            nn.Linear(32, ch_n),
+        )
+    
+    def forward(self, x):
+        return self.main(x)
+    
+class LabelIntegrator(nn.Module):
+    def __init__(self, ch_out:int=8, ch_n:int=8):
+        super().__init__()
+
+        self.main = nn.Sequential(
+            nn.Linear(ch_out+ch_n, 32),
+            nn.SiLU(),
+            nn.Linear(32, ch_n),
+        )
+    
+    def forward(self, x):
+        return self.main(x)
+
+class Outputinterpreter(nn.Module):
+    def __init__(self, ch_out:int=8, ch_n:int=8):
+        super().__init__()
+
+        self.main = nn.Sequential(
+            nn.Linear(ch_n, 32),
+            nn.SiLU(),
+            nn.Linear(32, ch_out),
+        )
+    
+    def forward(self, x):
+        return self.main(x)
+
+# Function that takes in a pair of nodes (with their info) and edge and outputs a message for each
+class Message(nn.Module):
+    def __init__(self, ch_n:int=8, ch_e:int=8):
+        super().__init__()
+
+        self.main = nn.Sequential(
+            nn.Linear(ch_n*2 + ch_e, 64),
             nn.SiLU(),
             nn.Linear(64, 32),
             nn.SiLU(),
@@ -21,11 +60,11 @@ class Message(nn.Module):
 
 # Takes in aggregated forward messages, backward messages, and current node state (plus info) and outputs an update for the node
 class Update(nn.Module):
-    def __init__(self, ch_n:int=8, ch_extra:int=6):
+    def __init__(self, ch_n:int=8):
         super().__init__()
         
         self.main = nn.Sequential(
-            nn.Linear(ch_n*3 + ch_extra, 64),
+            nn.Linear(ch_n*3, 64),
             nn.SiLU(),
             nn.Linear(64, 32),
             nn.SiLU(),
@@ -37,11 +76,11 @@ class Update(nn.Module):
 
 # Takes in a vertex and any additional info about it and generates keys / queries
 class Attention(nn.Module):
-    def __init__(self, ch_n:int=8, ch_k:int=8, ch_extra:int=6):
+    def __init__(self, ch_n:int=8, ch_k:int=8):
         super().__init__()
         
         self.main = nn.Sequential(
-            nn.Linear(ch_n+ch_extra, 64),
+            nn.Linear(ch_n, 64),
             nn.SiLU(),
             nn.Linear(64, 32),
             nn.SiLU(),
@@ -54,8 +93,8 @@ class Attention(nn.Module):
 
 class NeuralGraph(nn.Module):
     def __init__(self, n_nodes, n_inputs, n_outputs, connections, ch_n=8, ch_e=8, ch_k=8, ch_inp=1, ch_out=1, decay=0, leakage=0,
-                 value_range=[-100, 100], value_init="trainable", init_value_std=1, set_nodes=False, aggregation="attention", n_heads=1,
-                 use_label=True, node_dropout_p=0, edge_dropout_p=0, poolsize=None, device="cpu",
+                 value_range=[-100, 100], value_init="trainable", init_value_std=1, set_nodes=False, aggregation="attention", device="cpu", 
+                 use_label=True, node_dropout_p=0, edge_dropout_p=0, poolsize=None,
                  n_models=1, message_generator=Message, update_generator=Update, attention_generator=Attention):
         """
         Creates a Neural Graph.  A Neural Graph is an arbitrary directed graph which has input nodes and output nodes.  
@@ -114,45 +153,35 @@ class NeuralGraph(nn.Module):
         self.ch_n, self.ch_e, self.ch_k, self.ch_inp, self.ch_out = ch_n, ch_e, ch_k, ch_inp, ch_out
         self.decay, self.value_range, self.leakage, self.n_models = decay, value_range, leakage, n_models
         self.value_init, self.set_nodes, self.aggregation, self.use_label = value_init, set_nodes, aggregation, use_label
-        self.init_value_std, self.n_heads = init_value_std, n_heads
+        self.init_value_std = init_value_std
         self.node_dropout_p, self.edge_dropout_p, self.poolsize = node_dropout_p, edge_dropout_p, poolsize
         self.device = device
         self.pool = None
 
         assert self.aggregation in ["attention", "sum", "mean"], f"Unknown aggregation option {self.aggregation}"
-        assert self.ch_n % self.n_heads == 0 and self.ch_k % self.n_heads == 0, "ch_n and ch_k need to be divisible by n_heads"
 
-        self.ch_extra = self.ch_inp + 3 + (self.ch_out+1 if use_label else 0)
-        # extra channels are
-        # 0:ch_inp is inp
 
-        # USED IF use_label SET TO TRUE
-        # ch_inp:ch_inp+ch_out is label
-        # -4:hasLabel
-        
-        # -3:isInp
-        # -2:isHid
-        # -1:isOut
-        
         if self.value_init == "trainable":
             self.register_parameter("init_nodes", nn.Parameter(torch.randn(self.n_nodes, self.ch_n, device=self.device) * self.init_value_std, requires_grad=True))
             self.register_parameter("init_edges", nn.Parameter(torch.randn(self.n_edges, self.ch_e, device=self.device) * self.init_value_std, requires_grad=True))
 
         self.register_buffer('nodes', torch.zeros(1, self.n_nodes, self.ch_n, device=self.device), persistent=False)
-        self.register_buffer('node_info', torch.zeros(1, self.n_nodes, self.ch_extra, device=self.device), persistent=False)
         self.register_buffer('edges', torch.zeros(1, self.n_edges, self.ch_e, device=self.device), persistent=False)
 
         # If training with persistence, initialize the pool with poolsize
         if self.poolsize:
             self.init_vals(batch_size=self.poolsize)
 
-        self.messages = nn.ModuleList([message_generator(ch_n=ch_n, ch_e=ch_e, ch_extra=self.ch_extra).to(self.device) for _ in range(self.n_models)])
-        self.updates = nn.ModuleList([update_generator(ch_n=ch_n, ch_extra=self.ch_extra).to(self.device) for _ in range(self.n_models)])
+        self.inp_int = InputIntegrator(ch_inp=ch_inp, ch_n=ch_n)
+        self.out_int = Outputinterpreter(ch_out=ch_out, ch_n=ch_n)
+        if self.use_label:
+            self.label_int = LabelIntegrator(ch_out=ch_out, ch_n=ch_n)
+
+        self.messages = nn.ModuleList([message_generator(ch_n=ch_n, ch_e=ch_e).to(self.device) for _ in range(self.n_models)])
+        self.updates = nn.ModuleList([update_generator(ch_n=ch_n).to(self.device) for _ in range(self.n_models)])
         
         if self.aggregation == 'attention':
-            self.multi_head_outa = nn.Linear(self.ch_n, self.ch_n, bias=False)
-            self.multi_head_outb = nn.Linear(self.ch_n, self.ch_n, bias=False)
-            self.attentions = nn.ModuleList([attention_generator(ch_n=ch_n, ch_k=ch_k, ch_extra=self.ch_extra).to(self.device) for _ in range(self.n_models)])
+            self.attentions = nn.ModuleList([attention_generator(ch_n=ch_n, ch_k=ch_k).to(self.device) for _ in range(self.n_models)])
         
         conn_a, conn_b = zip(*connections)
         self.conn_a = torch.tensor(conn_a).long().to(self.device)
@@ -182,17 +211,16 @@ class NeuralGraph(nn.Module):
         indices = self.pool if self.pool is not None else np.arange(len(self.nodes))
 
         # Get messages
-        node_data = torch.cat([self.node_info[indices], self.nodes[indices]], axis=2)
-        m_x = torch.cat([node_data[:, self.conn_a], node_data[:, self.conn_b], self.edges[indices]], dim=2)
+        m_x = torch.cat([self.nodes[indices][:, self.conn_a], self.nodes[indices][:, self.conn_b], self.edges[indices]], dim=2)
         m = self.messages[t % self.n_models](m_x)
         
         m_a, m_b, m_ab = torch.split(m, [self.ch_n, self.ch_n, self.ch_e], 2)
         
         if self.aggregation == "attention":
-            attention = self.attentions[t % self.n_models](node_data)
-            attention = attention.reshape(*attention.shape[:-1], self.n_heads, (self.ch_k*4)//self.n_heads)
-
-            f_keys, f_queries, b_keys, b_queries = torch.split(attention, [self.ch_k//self.n_heads,]*4, -1)
+            attention = self.attentions[t % self.n_models](self.nodes[indices])
+            f_keys, f_queries, b_keys, b_queries = torch.split(attention, [self.ch_k,]*4, -1)
+            
+            
             f = (f_keys[:, self.conn_a] * f_queries[:, self.conn_b]).sum(-1)
             b = (b_queries[:, self.conn_a] * b_keys[:, self.conn_b]).sum(-1)
 
@@ -202,22 +230,17 @@ class NeuralGraph(nn.Module):
             f_ws = torch.exp(10*torch.tanh(f/10))
             b_ws = torch.exp(10*torch.tanh(b/10))
 
-            f_w_agg = torch.zeros(len(indices), self.n_nodes, self.n_heads, device=self.device)
-            b_w_agg = torch.zeros(len(indices), self.n_nodes, self.n_heads, device=self.device)
+            f_w_agg = torch.zeros(len(indices), self.n_nodes, device=self.device)
+            b_w_agg = torch.zeros(len(indices), self.n_nodes, device=self.device)
 
             f_w_agg.index_add_(1, self.conn_b, f_ws)
             b_w_agg.index_add_(1, self.conn_a, b_ws)
 
-            # batch, n_edges, n_heads
             f_attention = f_ws / f_w_agg[:, self.conn_b]
             b_attention = b_ws / b_w_agg[:, self.conn_a]
 
-            # -> batch, n_edges, ch_n
-            heads_b = m_b.reshape(*m_b.shape[:-1], self.n_heads, self.ch_n//self.n_heads) * torch.repeat_interleave(f_attention.unsqueeze(-1), self.ch_n//self.n_heads, -1)
-            heads_a = m_a.reshape(*m_a.shape[:-1], self.n_heads, self.ch_n//self.n_heads) * torch.repeat_interleave(b_attention.unsqueeze(-1), self.ch_n//self.n_heads, -1)
-            
-            m_b = self.multi_head_outb(heads_b.reshape(*m_b.shape))
-            m_a = self.multi_head_outa(heads_a.reshape(*m_a.shape))
+            m_b = m_b * torch.repeat_interleave(f_attention.unsqueeze(-1), self.ch_n, -1)
+            m_a = m_a * torch.repeat_interleave(b_attention.unsqueeze(-1), self.ch_n, -1)
 
         
         # Aggregate messages (summing up for now.  Could make it average instead)
@@ -231,7 +254,7 @@ class NeuralGraph(nn.Module):
             agg_m_b.divide_(self.counts_b[None, :, None])
         
         # Get updates
-        u_x = torch.cat([agg_m_a, agg_m_b, node_data], axis=2)
+        u_x = torch.cat([agg_m_a, agg_m_b, self.nodes[indices]], axis=2)
         update = self.updates[t % self.n_models](u_x)
 
         # apply dropouts
@@ -271,11 +294,6 @@ class NeuralGraph(nn.Module):
         """
         if nodes:
             # Figure out dynamically with batch_size
-            self.node_info = torch.zeros(batch_size, self.n_nodes, self.ch_extra, device=self.device)
-            self.node_info[:, :self.n_inputs, -3] = 1
-            self.node_info[:, self.n_inputs:-self.n_outputs, -2] = 1
-            self.node_info[:, -self.n_outputs:, -1] = 1
-            
             if self.value_init == "trainable":
                 self.nodes = torch.repeat_interleave((self.init_nodes).clone().unsqueeze(0), batch_size, 0)
             elif self.value_init == "trainable_batch":
@@ -382,12 +400,12 @@ class NeuralGraph(nn.Module):
         if self.ch_inp == 1 and len(inp.shape) != 3:
             inp = inp.unsqueeze(-1)
 
-        # Clear out old input and labels and hasLabel
-        if self.use_label:
-            self.node_info[indices, -self.n_outputs:, self.ch_inp:self.ch_inp+self.ch_out] = 0
-            self.node_info[indices, :, -4] = 1       
-             
-        self.node_info[indices, :self.n_inputs, :self.ch_inp] = inp.clone()
+        int_inps = self.inp_int(torch.cat([inp, self.nodes[indices, :self.n_inputs]], axis=2))
+        
+        if self.set_nodes:
+            self.nodes[indices, :self.n_inputs] = int_inps
+        else:
+            self.nodes[indices, :self.n_inputs] += int_inps
         
         if label is not None:
             assert self.use_label, "Tried to apply labels but use_label was set to False"
@@ -397,9 +415,12 @@ class NeuralGraph(nn.Module):
             if self.ch_out == 1 and len(label.shape) != 3:
                 label = label.unsqueeze(-1)
             
-            # hasLabel = 1
-            self.node_info[indices, -self.n_outputs:, self.ch_inp:self.ch_inp+self.ch_out] = label.clone()
-            self.node_info[indices, :, -4] = 1
+
+            int_label = self.label_int(torch.cat([label, self.nodes[indices, -self.n_outputs:]], axis=2))
+            if self.set_nodes:
+                self.nodes[indices, -self.n_outputs:] = int_label
+            else:
+                self.nodes[indices, -self.n_outputs:] += int_label
             
     def read_outputs(self):
         """
@@ -410,8 +431,8 @@ class NeuralGraph(nn.Module):
         indices = self.pool if self.pool is not None else np.arange(len(self.nodes))
 
         if self.ch_out == 1:
-            return self.nodes[indices, -self.n_outputs:, 0].clone()
-        return self.nodes[indices, -self.n_outputs:, :self.ch_out].clone()
+            return self.out_int(self.nodes[indices, -self.n_outputs:]).squeeze(-1)
+        return self.out_int(self.nodes[indices, -self.n_outputs:])
     
     def overflow(self, k=5):
         """
@@ -437,9 +458,8 @@ class NeuralGraph(nn.Module):
         :param edges: Whether to update edges
         """
         timesteps = round(time / dt)
-        self.apply_vals(x)
-
         for t in range(timesteps):
+            self.apply_vals(x)
             self.timestep(nodes=nodes, edges=edges, dt=dt, t=t)
         return self.read_outputs()
     
@@ -458,9 +478,8 @@ class NeuralGraph(nn.Module):
         """
 
         timesteps = round(time / dt)
-        self.apply_vals(x, label=y)
-
         for t in range(timesteps-1):
+            self.apply_vals(x, label=y)
             self.timestep(nodes=nodes, edges=edges, dt=dt, t=t)
         self.timestep(nodes=nodes, edges=edges or edges_at_end, dt=dt, t=t)
     
