@@ -54,8 +54,8 @@ class Attention(nn.Module):
 
 class NeuralGraph(nn.Module):
     def __init__(self, n_nodes, n_inputs, n_outputs, connections, ch_n=8, ch_e=8, ch_k=8, ch_inp=1, ch_out=1, decay=0, leakage=0,
-                 value_range=[-100, 100], value_init="trainable", init_value_std=1, set_nodes=False, aggregation="attention", device="cpu", 
-                 use_label=True, node_dropout_p=0, edge_dropout_p=0, poolsize=None,
+                 value_range=[-100, 100], value_init="trainable", init_value_std=1, set_nodes=False, aggregation="attention", n_heads=1,
+                 use_label=True, node_dropout_p=0, edge_dropout_p=0, poolsize=None, device="cpu",
                  n_models=1, message_generator=Message, update_generator=Update, attention_generator=Attention):
         """
         Creates a Neural Graph.  A Neural Graph is an arbitrary directed graph which has input nodes and output nodes.  
@@ -114,13 +114,13 @@ class NeuralGraph(nn.Module):
         self.ch_n, self.ch_e, self.ch_k, self.ch_inp, self.ch_out = ch_n, ch_e, ch_k, ch_inp, ch_out
         self.decay, self.value_range, self.leakage, self.n_models = decay, value_range, leakage, n_models
         self.value_init, self.set_nodes, self.aggregation, self.use_label = value_init, set_nodes, aggregation, use_label
-        self.init_value_std = init_value_std
+        self.init_value_std, self.n_heads = init_value_std, n_heads
         self.node_dropout_p, self.edge_dropout_p, self.poolsize = node_dropout_p, edge_dropout_p, poolsize
         self.device = device
         self.pool = None
 
         assert self.aggregation in ["attention", "sum", "mean"], f"Unknown aggregation option {self.aggregation}"
-
+        assert self.ch_n % self.n_heads == 0 and self.ch_k % self.n_heads == 0, "ch_n and ch_k need to be divisible by n_heads"
 
         self.ch_extra = self.ch_inp + 3 + (self.ch_out+1 if use_label else 0)
         # extra channels are
@@ -150,6 +150,8 @@ class NeuralGraph(nn.Module):
         self.updates = nn.ModuleList([update_generator(ch_n=ch_n, ch_extra=self.ch_extra).to(self.device) for _ in range(self.n_models)])
         
         if self.aggregation == 'attention':
+            self.multi_head_outa = nn.Linear(self.ch_n, self.ch_n, bias=False)
+            self.multi_head_outb = nn.Linear(self.ch_n, self.ch_n, bias=False)
             self.attentions = nn.ModuleList([attention_generator(ch_n=ch_n, ch_k=ch_k, ch_extra=self.ch_extra).to(self.device) for _ in range(self.n_models)])
         
         conn_a, conn_b = zip(*connections)
@@ -187,10 +189,35 @@ class NeuralGraph(nn.Module):
         m_a, m_b, m_ab = torch.split(m, [self.ch_n, self.ch_n, self.ch_e], 2)
         
         if self.aggregation == "attention":
+            # if self.n_heads == 1:
+            #     attention = self.attentions[t % self.n_models](node_data)
+            #     f_keys, f_queries, b_keys, b_queries = torch.split(attention, [self.ch_k,]*4, -1)
+            #     f = (f_keys[:, self.conn_a] * f_queries[:, self.conn_b]).sum(-1)
+            #     b = (b_queries[:, self.conn_a] * b_keys[:, self.conn_b]).sum(-1)
+
+            #     # Very hard to get max trick working with this implementation of softmax
+            #     # Therefore we will just do a soft clamp with tanh to ensure no value gets too big
+
+            #     f_ws = torch.exp(10*torch.tanh(f/10))
+            #     b_ws = torch.exp(10*torch.tanh(b/10))
+
+            #     f_w_agg = torch.zeros(len(indices), self.n_nodes, device=self.device)
+            #     b_w_agg = torch.zeros(len(indices), self.n_nodes, device=self.device)
+
+            #     f_w_agg.index_add_(1, self.conn_b, f_ws)
+            #     b_w_agg.index_add_(1, self.conn_a, b_ws)
+
+            #     f_attention = f_ws / f_w_agg[:, self.conn_b]
+            #     b_attention = b_ws / b_w_agg[:, self.conn_a]
+
+            #     m_b = m_b * torch.repeat_interleave(f_attention.unsqueeze(-1), self.ch_n, -1)
+            #     m_a = m_a * torch.repeat_interleave(b_attention.unsqueeze(-1), self.ch_n, -1)
+
+            # else:
             attention = self.attentions[t % self.n_models](node_data)
-            f_keys, f_queries, b_keys, b_queries = torch.split(attention, [self.ch_k,]*4, -1)
-            
-            
+            attention = attention.reshape(*attention.shape[:-1], self.n_heads, (self.ch_k*4)//self.n_heads)
+
+            f_keys, f_queries, b_keys, b_queries = torch.split(attention, [self.ch_k//self.n_heads,]*4, -1)
             f = (f_keys[:, self.conn_a] * f_queries[:, self.conn_b]).sum(-1)
             b = (b_queries[:, self.conn_a] * b_keys[:, self.conn_b]).sum(-1)
 
@@ -200,17 +227,22 @@ class NeuralGraph(nn.Module):
             f_ws = torch.exp(10*torch.tanh(f/10))
             b_ws = torch.exp(10*torch.tanh(b/10))
 
-            f_w_agg = torch.zeros(len(indices), self.n_nodes, device=self.device)
-            b_w_agg = torch.zeros(len(indices), self.n_nodes, device=self.device)
+            f_w_agg = torch.zeros(len(indices), self.n_nodes, self.n_heads, device=self.device)
+            b_w_agg = torch.zeros(len(indices), self.n_nodes, self.n_heads, device=self.device)
 
             f_w_agg.index_add_(1, self.conn_b, f_ws)
             b_w_agg.index_add_(1, self.conn_a, b_ws)
 
+            # batch, n_edges, n_heads
             f_attention = f_ws / f_w_agg[:, self.conn_b]
             b_attention = b_ws / b_w_agg[:, self.conn_a]
 
-            m_b = m_b * torch.repeat_interleave(f_attention.unsqueeze(-1), self.ch_n, -1)
-            m_a = m_a * torch.repeat_interleave(b_attention.unsqueeze(-1), self.ch_n, -1)
+            # -> batch, n_edges, ch_n
+            heads_b = m_b.reshape(*m_b.shape[:-1], self.n_heads, self.ch_n//self.n_heads) * torch.repeat_interleave(f_attention.unsqueeze(-1), self.ch_n//self.n_heads, -1)
+            heads_a = m_a.reshape(*m_a.shape[:-1], self.n_heads, self.ch_n//self.n_heads) * torch.repeat_interleave(b_attention.unsqueeze(-1), self.ch_n//self.n_heads, -1)
+            
+            m_b = self.multi_head_outb(heads_b.reshape(*m_b.shape))
+            m_a = self.multi_head_outa(heads_a.reshape(*m_a.shape))
 
         
         # Aggregate messages (summing up for now.  Could make it average instead)
