@@ -29,7 +29,7 @@ class LabelIntegrator(nn.Module):
     def forward(self, x):
         return self.main(x)
 
-class Outputinterpreter(nn.Module):
+class OutputInterpreter(nn.Module):
     def __init__(self, ch_out:int=8, ch_n:int=8):
         super().__init__()
 
@@ -95,7 +95,8 @@ class NeuralGraph(nn.Module):
     def __init__(self, n_nodes, n_inputs, n_outputs, connections, ch_n=8, ch_e=8, ch_k=8, ch_inp=1, ch_out=1, decay=0, leakage=0,
                  value_range=[-100, 100], value_init="trainable", init_value_std=1, set_nodes=False, aggregation="attention", n_heads=1,
                  use_label=True, node_dropout_p=0, edge_dropout_p=0, poolsize=None, device="cpu",
-                 n_models=1, message_generator=Message, update_generator=Update, attention_generator=Attention):
+                 n_models=1, message_generator=Message, update_generator=Update, attention_generator=Attention, 
+                 inp_int_generator=InputIntegrator, label_int_generator=LabelIntegrator, out_int_generator=OutputInterpreter):
         """
         Creates a Neural Graph.  A Neural Graph is an arbitrary directed graph which has input nodes and output nodes.  
         Every node and edge in the graph has a state which is represented as a vector with dimensionality of ch_n and ch_e repectively.
@@ -143,6 +144,12 @@ class NeuralGraph(nn.Module):
             specific shape of input_shape=(ch_n*3) and output_shape=(ch_n)
         :param attention_generator: Function to generate attention models.  Must have very 
             specific shape of input_shape=(ch_n) and output_shape=(ch_k*4)
+        :param inp_int_generator: Function to generate input integrator.  Must have very
+            specific shape of input_shape=(ch_inp+ch_n) and output_shape=(ch_n)
+        :param label_int_generator: Function to generate label integrator.  Must have very
+            specific shape of input_shape=(ch_out+ch_n) and output_shape=(ch_n)
+        :param out_int_generator: Function to generate output interpreter.  Must have very
+            specific shape of input_shape=(ch_n) and output_shape=(ch_out)
         """
         super().__init__()
         
@@ -180,10 +187,10 @@ class NeuralGraph(nn.Module):
             self.multi_head_outb = nn.Linear(self.ch_n, self.ch_n, bias=False).to(self.device)
             self.attentions = nn.ModuleList([attention_generator(ch_n=ch_n, ch_k=ch_k).to(self.device) for _ in range(self.n_models)])
         
-        self.inp_int = InputIntegrator(ch_inp=ch_inp, ch_n=ch_n)
-        self.out_int = Outputinterpreter(ch_out=ch_out, ch_n=ch_n)
+        self.inp_int = inp_int_generator(ch_inp=ch_inp, ch_n=ch_n)
+        self.out_int = out_int_generator(ch_out=ch_out, ch_n=ch_n)
         if self.use_label:
-            self.label_int = LabelIntegrator(ch_out=ch_out, ch_n=ch_n)
+            self.label_int = label_int_generator(ch_out=ch_out, ch_n=ch_n)
 
         conn_a, conn_b = zip(*connections)
         self.conn_a = torch.tensor(conn_a).long().to(self.device)
