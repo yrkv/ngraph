@@ -150,8 +150,8 @@ class NeuralGraph(nn.Module):
         self.updates = nn.ModuleList([update_generator(ch_n=ch_n, ch_extra=self.ch_extra).to(self.device) for _ in range(self.n_models)])
         
         if self.aggregation == 'attention':
-            self.multi_head_outa = nn.Linear(self.ch_n, self.ch_n, bias=False)
-            self.multi_head_outb = nn.Linear(self.ch_n, self.ch_n, bias=False)
+            self.multi_head_outa = nn.Linear(self.ch_n, self.ch_n, bias=False).to(self.device)
+            self.multi_head_outb = nn.Linear(self.ch_n, self.ch_n, bias=False).to(self.device)
             self.attentions = nn.ModuleList([attention_generator(ch_n=ch_n, ch_k=ch_k, ch_extra=self.ch_extra).to(self.device) for _ in range(self.n_models)])
         
         conn_a, conn_b = zip(*connections)
