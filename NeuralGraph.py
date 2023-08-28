@@ -153,8 +153,6 @@ class NeuralGraph(nn.Module):
         """
         super().__init__()
         
-        assert ch_n >= ch_out, f"Number of output channels ({ch_out}) is greater than total node channels ({ch_n})"
-        
         self.n_nodes, self.n_edges, self.connections = n_nodes, len(connections), connections
         self.n_inputs, self.n_outputs = n_inputs, n_outputs
         self.ch_n, self.ch_e, self.ch_k, self.ch_inp, self.ch_out = ch_n, ch_e, ch_k, ch_inp, ch_out
