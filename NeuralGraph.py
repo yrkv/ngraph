@@ -201,13 +201,13 @@ class NeuralGraph(nn.Module):
         self.counts_a[self.counts_a == 0] = 1
         self.counts_b[self.counts_b == 0] = 1
         
-    def timestep(self, dt=1, nodes=True, edges=True, t=0):
+    def timestep(self, dt=1, step_nodes=True, step_edges=True, t=0):
         """
         Runs one timestep of the Neural Graph.
         :param dt: The temporal resolution of the timestep.  At the limit of dt->0, the rules become differential equations.
             This was inspired by smoothlife/lenia
-        :param nodes: Whether to update node values this timestep
-        :param edges: Whether to update edge values this timestep
+        :param step_nodes: Whether to update node values this timestep
+        :param step_edges: Whether to update edge values this timestep
         :param t: The current timestep (used to decide which set of models to use)
         """
 
@@ -215,16 +215,20 @@ class NeuralGraph(nn.Module):
 
         assert self.pool is not None or self.poolsize is None, "No pool selected but poolsize > 0"
 
-        indices = self.pool if self.pool is not None else np.arange(len(self.nodes))
+        # indices = self.pool if self.pool is not None else np.arange(len(self.nodes))
+        batch_size = len(self.nodes) if (self.pool is None) else self.poolsize
+
+        nodes = self.nodes if (self.pool is None) else self.nodes[self.pool]
+        edges = self.edges if (self.pool is None) else self.edges[self.pool]
 
         # Get messages
-        m_x = torch.cat([self.nodes[indices][:, self.conn_a], self.nodes[indices][:, self.conn_b], self.edges[indices]], dim=2)
+        m_x = torch.cat([nodes[:, self.conn_a], nodes[:, self.conn_b], edges], dim=2)
         m = self.messages[t % self.n_models](m_x)
         
         m_a, m_b, m_ab = torch.split(m, [self.ch_n, self.ch_n, self.ch_e], 2)
         
         if self.aggregation == "attention":
-            attention = self.attentions[t % self.n_models](self.nodes[indices])
+            attention = self.attentions[t % self.n_models](nodes)
             attention = attention.reshape(*attention.shape[:-1], self.n_heads, (self.ch_k*4)//self.n_heads)
 
             f_keys, f_queries, b_keys, b_queries = torch.split(attention, [self.ch_k//self.n_heads,]*4, -1)
@@ -237,8 +241,8 @@ class NeuralGraph(nn.Module):
             f_ws = torch.exp(10*torch.tanh(f/10))
             b_ws = torch.exp(10*torch.tanh(b/10))
 
-            f_w_agg = torch.zeros(len(indices), self.n_nodes, self.n_heads, device=self.device)
-            b_w_agg = torch.zeros(len(indices), self.n_nodes, self.n_heads, device=self.device)
+            f_w_agg = torch.zeros(batch_size, self.n_nodes, self.n_heads, device=self.device)
+            b_w_agg = torch.zeros(batch_size, self.n_nodes, self.n_heads, device=self.device)
 
             f_w_agg.index_add_(1, self.conn_b, f_ws)
             b_w_agg.index_add_(1, self.conn_a, b_ws)
@@ -256,8 +260,8 @@ class NeuralGraph(nn.Module):
 
         
         # Aggregate messages (summing up for now.  Could make it average instead)
-        agg_m_a = torch.zeros(len(indices), self.n_nodes, self.ch_n, device=self.device)
-        agg_m_b = torch.zeros(len(indices), self.n_nodes, self.ch_n, device=self.device)
+        agg_m_a = torch.zeros(batch_size, self.n_nodes, self.ch_n, device=self.device)
+        agg_m_b = torch.zeros(batch_size, self.n_nodes, self.ch_n, device=self.device)
         agg_m_a.index_add_(1, self.conn_a, m_a)
         agg_m_b.index_add_(1, self.conn_b, m_b)
 
@@ -266,36 +270,51 @@ class NeuralGraph(nn.Module):
             agg_m_b.divide_(self.counts_b[None, :, None])
         
         # Get updates
-        u_x = torch.cat([agg_m_a, agg_m_b, self.nodes[indices]], axis=2)
+        u_x = torch.cat([agg_m_a, agg_m_b, nodes], axis=2)
         update = self.updates[t % self.n_models](u_x)
 
+        # TODO: these dropouts are wrong
         # apply dropouts
-        masked_update = update * torch.where(torch.rand_like(update) < self.node_dropout_p, 0, 1)
-        masked_m_ab = m_ab * torch.where(torch.rand_like(m_ab) < self.edge_dropout_p, 0, 1)
+        if self.node_dropout_p > 0:
+            update = update * torch.where(torch.rand_like(update) < self.node_dropout_p, 0, 1)
+        if self.edge_dropout_p > 0:
+            m_ab = m_ab * torch.where(torch.rand_like(m_ab) < self.edge_dropout_p, 0, 1)
 
-        # Calculate leakage for each node
-        agg_leakage = torch.zeros(len(indices), self.n_nodes, self.ch_n, device=self.device)
-        agg_leakage.index_add_(1, self.conn_a, self.nodes[indices][:, self.conn_b])
-        agg_leakage.index_add_(1, self.conn_b, self.nodes[indices][:, self.conn_a])
-        agg_leakage.divide_(torch.repeat_interleave((self.counts_a+self.counts_b).unsqueeze(1), self.ch_n, 1))
+        if self.leakage > 0:
+            # Calculate leakage for each node
+            agg_leakage = torch.zeros(batch_size, self.n_nodes, self.ch_n, device=self.device)
+            agg_leakage.index_add_(1, self.conn_a, nodes[:, self.conn_b])
+            agg_leakage.index_add_(1, self.conn_b, nodes[:, self.conn_a])
+            agg_leakage.divide_((self.counts_a + self.counts_b).view(-1, 1).expand(-1, self.ch_n))
 
 
         # Apply updates
-        if nodes:
+        if step_nodes:
             if self.set_nodes:
-                # Just set the nodes instead of adding to them
-                # Ignores dt
-                self.nodes[indices] = ((1-self.leakage)*(1-self.decay)*masked_update+self.leakage*agg_leakage).clamp(*self.value_range)
+                _nodes = update
             else:
-                # Node values get decayed and leaked into
+                _nodes = nodes
+                if self.decay > 0:
+                    _nodes *= ((1-self.decay)**dt)
+                _nodes += update*dt
 
-                # Decay node state and add update
-                new_node_state = self.nodes[indices] * ((1-self.decay)**dt) + masked_update*dt
-                # Leak in other connected node states and clamp
-                self.nodes[indices] = ((1-self.leakage)*new_node_state+self.leakage*agg_leakage).clamp(*self.value_range)
+            if self.leakage > 0:
+                _nodes = (1-self.leakage) * _nodes + self.leakage * agg_leakage
 
-        if edges:
-            self.edges[indices] = (self.edges[indices] + masked_m_ab).clamp(*self.value_range)
+        
+            # Node values get decayed and leaked into
+
+            # Decay node state and add update
+            # updated_nodes = nodes * ((1-self.decay)**dt) + masked_update*dt
+            # leaked_nodes = updated_nodes * (1-self.leakage) + self.leakage*agg_leakage
+            # Leak in other connected node states and clamp
+            
+            # self.nodes[indices] = leaked_nodes.clamp(*self.value_range)
+            self.nodes[:] = _nodes.clamp(*self.value_range)
+
+        if step_edges:
+            # self.edges[indices] = (edges + masked_m_ab).clamp(*self.value_range)
+            self.edges[:] = (edges + m_ab).clamp(*self.value_range)
         
     def init_vals(self, nodes=True, edges=True, batch_size=1):
         """
