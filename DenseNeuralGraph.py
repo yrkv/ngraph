@@ -219,10 +219,12 @@ class NeuralGraph(nn.Module):
             f_keys, f_queries, b_keys, b_queries = torch.split(attention, [self.ch_k//self.n_heads,]*4, -1)
  
             f = nn.functional.softmax(
-                (torch.repeat_interleave(f_keys.unsqueeze(1), self.n_nodes, axis=1) * torch.repeat_interleave(f_queries.unsqueeze(2), self.n_nodes, axis=2)).sum(-1)
+                (torch.repeat_interleave(f_keys.unsqueeze(1), self.n_nodes, axis=1) * torch.repeat_interleave(f_queries.unsqueeze(2), self.n_nodes, axis=2)).sum(-1),
+                axis=2
             )
             b = nn.functional.softmax(
-                (torch.repeat_interleave(b_queries.unsqueeze(1), self.n_nodes, axis=1) * torch.repeat_interleave(b_keys.unsqueeze(2), self.n_nodes, axis=2)).sum(-1)
+                (torch.repeat_interleave(b_queries.unsqueeze(1), self.n_nodes, axis=1) * torch.repeat_interleave(b_keys.unsqueeze(2), self.n_nodes, axis=2)).sum(-1),
+                axis=1
             )
 
             heads_b = m_b.reshape(*m_b.shape[:-1], self.n_heads, self.ch_n//self.n_heads) * torch.repeat_interleave(f.unsqueeze(-1), self.ch_n//self.n_heads, -1)
@@ -285,7 +287,7 @@ class NeuralGraph(nn.Module):
             
         if edges:
             if self.value_init == "trainable":
-                self.edges = torch.repeat_interleave((self.init_edges).clone().unsqueeze(0), batch_size, 0)
+                self.edges = torch.repeat_interleave(self.init_edges.clone().unsqueeze(0), batch_size, 0)
             elif self.value_init == "trainable_batch":
                 if not hasattr(self, "init_edges"):
                     self.register_parameter("init_edges", nn.Parameter(torch.randn(batch_size, self.n_nodes, self.n_nodes, self.ch_e, device=self.device) * self.init_value_std, requires_grad=True))
