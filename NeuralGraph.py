@@ -217,24 +217,25 @@ class NeuralGraph(nn.Module):
 
         assert self.pool is not None or self.poolsize is None, "No pool selected but poolsize > 0"
 
-        # indices = self.pool if self.pool is not None else np.arange(len(self.nodes))
+        indices = self.pool if self.pool is not None else np.arange(len(self.nodes))
         batch_size = len(self.nodes) if (self.pool is None) else self.poolsize
 
-        nodes = self.nodes if (self.pool is None) else self.nodes[self.pool]
-        edges = self.edges if (self.pool is None) else self.edges[self.pool]
+        nodes = self.nodes.clone() if (self.pool is None) else self.nodes[self.pool]
+        edges = self.edges.clone() if (self.pool is None) else self.edges[self.pool]
 
         # Get messages
         m_x = torch.cat([nodes[:, self.conn_a], nodes[:, self.conn_b], edges], dim=2)
+        # a = torch.stack([self.conn_a, self.conn_b, self.conn_b], dim=-1)
+        # m_x = nodes[:, a].flatten(2)
+        # m_x[:, :, self.ch_n*2:] = edges
         m = self.messages[t % self.n_models](m_x)
         
-        m_a, m_b, m_ab = torch.split(m, [self.ch_n, self.ch_n, self.ch_e], 2)
+        # m_a, m_b, m_ab = torch.split(m, [self.ch_n, self.ch_n, self.ch_e], 2)
+        m_a, m_b, m_ab = torch.tensor_split(m, [self.ch_n, self.ch_n*2], 2)
         
         if self.aggregation == "attention":
             attention = self.attentions[t % self.n_models](nodes)
-            print(attention.shape)
             attention = attention.reshape(*attention.shape[:-1], self.n_heads, (self.ch_k*4)//self.n_heads)
-            # attention = attention.reshape(60, 20, self.n_heads, (self.ch_k*4)//self.n_heads)
-            print(attention.shape)
             
             f_keys, f_queries, b_keys, b_queries = torch.split(attention, [self.ch_k//self.n_heads,]*4, -1)
             f = (f_keys[:, self.conn_a] * f_queries[:, self.conn_b]).sum(-1)
@@ -264,14 +265,14 @@ class NeuralGraph(nn.Module):
             m_a = self.multi_head_outa(heads_a.reshape(*m_a.shape))
 
         # TODO: This aggregating code may be wrong
-        agg_m_a = (m_a.view(-1,self.n_nodes,self.n_nodes,self.ch_n) * self.conn_mat[None, :, :, None]).sum(2)
-        agg_m_b = (m_b.view(-1,self.n_nodes,self.n_nodes,self.ch_n) * self.conn_mat[None, :, :, None]).sum(1)
+        # agg_m_a = (m_a.view(-1,self.n_nodes,self.n_nodes,self.ch_n) * self.conn_mat[None, :, :, None]).sum(2)
+        # agg_m_b = (m_b.view(-1,self.n_nodes,self.n_nodes,self.ch_n) * self.conn_mat[None, :, :, None]).sum(1)
         
         # Aggregate messages (summing up for now.  Could make it average instead)
-        # agg_m_a = torch.zeros(batch_size, self.n_nodes, self.ch_n, device=self.device)
-        # agg_m_b = torch.zeros(batch_size, self.n_nodes, self.ch_n, device=self.device)
-        # agg_m_a.index_add_(1, self.conn_a, m_a)
-        # agg_m_b.index_add_(1, self.conn_b, m_b)
+        agg_m_a = torch.zeros(batch_size, self.n_nodes, self.ch_n, device=self.device)
+        agg_m_b = torch.zeros(batch_size, self.n_nodes, self.ch_n, device=self.device)
+        agg_m_a.index_add_(1, self.conn_a, m_a)
+        agg_m_b.index_add_(1, self.conn_b, m_b)
 
         if self.aggregation == "mean":
             agg_m_a.divide_(self.counts_a[None, :, None])
@@ -295,34 +296,36 @@ class NeuralGraph(nn.Module):
             agg_leakage.index_add_(1, self.conn_b, nodes[:, self.conn_a])
             agg_leakage.divide_((self.counts_a + self.counts_b).view(-1, 1).expand(-1, self.ch_n))
 
-
-        # Apply updates
+        
         if step_nodes:
             if self.set_nodes:
                 _nodes = update
             else:
                 _nodes = nodes
                 if self.decay > 0:
-                    _nodes *= ((1-self.decay)**dt)
-                _nodes += update*dt
+                    _nodes = _nodes * ((1-self.decay)**dt)
+                _nodes = _nodes + update*dt
 
             if self.leakage > 0:
                 _nodes = (1-self.leakage) * _nodes + self.leakage * agg_leakage
-
-        
-            # Node values get decayed and leaked into
-
-            # Decay node state and add update
-            # updated_nodes = nodes * ((1-self.decay)**dt) + masked_update*dt
-            # leaked_nodes = updated_nodes * (1-self.leakage) + self.leakage*agg_leakage
-            # Leak in other connected node states and clamp
-            
-            # self.nodes[indices] = leaked_nodes.clamp(*self.value_range)
             self.nodes[:] = _nodes.clamp(*self.value_range)
 
         if step_edges:
-            # self.edges[indices] = (edges + masked_m_ab).clamp(*self.value_range)
             self.edges[:] = (edges + m_ab).clamp(*self.value_range)
+
+    
+        # # Apply updates
+        # if step_nodes:
+        #     if self.set_nodes:
+        #         # Just set the nodes instead of adding to them
+        #         # Ignores dt
+        #         self.nodes[indices] = ((1-self.leakage)*(1-self.decay)*update+self.leakage*agg_leakage).clamp(*self.value_range)
+        #     else:
+        #         new_node_state = self.nodes[indices] * ((1-self.decay)**dt) + update*dt
+        #         self.nodes[indices] = ((1-self.leakage)*new_node_state+self.leakage*agg_leakage).clamp(*self.value_range)
+
+        # if step_edges:
+        #     self.edges[indices] = (self.edges[indices] + m_ab).clamp(*self.value_range)
         
     def init_vals(self, nodes=True, edges=True, batch_size=1):
         """
