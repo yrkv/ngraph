@@ -193,6 +193,8 @@ class NeuralGraph(nn.Module):
         conn_a, conn_b = zip(*connections)
         self.conn_a = torch.tensor(conn_a).long().to(self.device)
         self.conn_b = torch.tensor(conn_b).long().to(self.device)
+        self.conn_mat = torch.zeros(self.n_nodes, self.n_nodes).to(self.device)
+        self.conn_mat[self.conn_a, self.conn_b] = 1
         
         self.counts_a = torch.zeros(self.n_nodes, device=self.device).long()
         self.counts_b = torch.zeros(self.n_nodes, device=self.device).long()
@@ -229,8 +231,11 @@ class NeuralGraph(nn.Module):
         
         if self.aggregation == "attention":
             attention = self.attentions[t % self.n_models](nodes)
+            print(attention.shape)
             attention = attention.reshape(*attention.shape[:-1], self.n_heads, (self.ch_k*4)//self.n_heads)
-
+            # attention = attention.reshape(60, 20, self.n_heads, (self.ch_k*4)//self.n_heads)
+            print(attention.shape)
+            
             f_keys, f_queries, b_keys, b_queries = torch.split(attention, [self.ch_k//self.n_heads,]*4, -1)
             f = (f_keys[:, self.conn_a] * f_queries[:, self.conn_b]).sum(-1)
             b = (b_queries[:, self.conn_a] * b_keys[:, self.conn_b]).sum(-1)
@@ -258,12 +263,15 @@ class NeuralGraph(nn.Module):
             m_b = self.multi_head_outb(heads_b.reshape(*m_b.shape))
             m_a = self.multi_head_outa(heads_a.reshape(*m_a.shape))
 
+        # TODO: This aggregating code may be wrong
+        agg_m_a = (m_a.view(-1,self.n_nodes,self.n_nodes,self.ch_n) * self.conn_mat[None, :, :, None]).sum(2)
+        agg_m_b = (m_b.view(-1,self.n_nodes,self.n_nodes,self.ch_n) * self.conn_mat[None, :, :, None]).sum(1)
         
         # Aggregate messages (summing up for now.  Could make it average instead)
-        agg_m_a = torch.zeros(batch_size, self.n_nodes, self.ch_n, device=self.device)
-        agg_m_b = torch.zeros(batch_size, self.n_nodes, self.ch_n, device=self.device)
-        agg_m_a.index_add_(1, self.conn_a, m_a)
-        agg_m_b.index_add_(1, self.conn_b, m_b)
+        # agg_m_a = torch.zeros(batch_size, self.n_nodes, self.ch_n, device=self.device)
+        # agg_m_b = torch.zeros(batch_size, self.n_nodes, self.ch_n, device=self.device)
+        # agg_m_a.index_add_(1, self.conn_a, m_a)
+        # agg_m_b.index_add_(1, self.conn_b, m_b)
 
         if self.aggregation == "mean":
             agg_m_a.divide_(self.counts_a[None, :, None])
