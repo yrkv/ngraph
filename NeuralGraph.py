@@ -185,10 +185,10 @@ class NeuralGraph(nn.Module):
             self.multi_head_outb = nn.Linear(self.ch_n, self.ch_n, bias=False).to(self.device)
             self.attentions = nn.ModuleList([attention_generator(ch_n=ch_n, ch_k=ch_k).to(self.device) for _ in range(self.n_models)])
         
-        self.inp_int = inp_int_generator(ch_inp=ch_inp, ch_n=ch_n)
-        self.out_int = out_int_generator(ch_out=ch_out, ch_n=ch_n)
+        self.inp_int = inp_int_generator(ch_inp=ch_inp, ch_n=ch_n).to(self.device)
+        self.out_int = out_int_generator(ch_out=ch_out, ch_n=ch_n).to(self.device)
         if self.use_label:
-            self.label_int = label_int_generator(ch_out=ch_out, ch_n=ch_n)
+            self.label_int = label_int_generator(ch_out=ch_out, ch_n=ch_n).to(self.device)
 
         conn_a, conn_b = zip(*connections)
         self.conn_a = torch.tensor(conn_a).long().to(self.device)
