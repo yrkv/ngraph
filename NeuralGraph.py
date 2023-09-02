@@ -507,7 +507,7 @@ class NeuralGraph(nn.Module):
         for t in range(timesteps):
             if not apply_once:
                 self.apply_vals(x)
-            self.timestep(nodes=nodes, edges=edges, dt=dt, t=t)
+            self.timestep(step_nodes=nodes, step_edges=edges, dt=dt, t=t)
         return self.read_outputs()
     
     def backward(self, x, y, time=5, dt=1, apply_once=False, nodes=True, edges=False, edges_at_end=True):
@@ -533,8 +533,8 @@ class NeuralGraph(nn.Module):
         for t in range(timesteps-1):
             if not apply_once:
                 self.apply_vals(x, label=y)
-            self.timestep(nodes=nodes, edges=edges, dt=dt, t=t)
-        self.timestep(nodes=nodes, edges=edges or edges_at_end, dt=dt, t=t)
+            self.timestep(step_nodes=nodes, step_edges=edges, dt=dt, t=t)
+        self.timestep(step_nodes=nodes, step_edges=edges or edges_at_end, dt=dt, t=t)
     
     def predict(self, X, time=5, dt=1, reset_nodes=False, **kwargs):
         """
