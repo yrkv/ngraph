@@ -92,11 +92,13 @@ class Attention(nn.Module):
 
 
 class NeuralGraph(nn.Module):
-    def __init__(self, n_nodes, n_inputs, n_outputs, connections, ch_n=8, ch_e=8, ch_k=8, ch_inp=1, ch_out=1, decay=0, leakage=0,
-                 value_range=[-100, 100], value_init="trainable", init_value_std=1, set_nodes=False, aggregation="attention", n_heads=1,
-                 use_label=True, node_dropout_p=0, edge_dropout_p=0, poolsize=None, device="cpu",
+    def __init__(self, n_nodes, n_inputs, n_outputs, connections, ch_n=8, ch_e=8, ch_k=8, ch_inp=1, ch_out=1,
+                 decay=0, leakage=0, clamp_mode="soft", max_value=1e6,
+                 value_init="trainable", init_value_std=1, set_nodes=False, aggregation="attention", n_heads=1,
+                 use_label=False, node_dropout_p=0, edge_dropout_p=0, poolsize=None, device="cpu",
                  n_models=1, message_generator=Message, update_generator=Update, attention_generator=Attention, 
-                 inp_int_generator=InputIntegrator, label_int_generator=LabelIntegrator, out_int_generator=OutputInterpreter):
+                 inp_int_generator=InputIntegrator, label_int_generator=LabelIntegrator,
+                 out_int_generator=OutputInterpreter):
         """
         Creates a Neural Graph.  A Neural Graph is an arbitrary directed graph which has input nodes and output nodes.  
         Every node and edge in the graph has a state which is represented as a vector with dimensionality of ch_n and ch_e repectively.
@@ -123,8 +125,9 @@ class NeuralGraph(nn.Module):
             (in either direction) will be averaged and put into A at each timestep.
             It will be combined with A's original value according to the equation
             nodeA = (1-leakage) * nodeA + leakage * avg_connect_node
-        :param value_range: The range that node and edge values can take.  Anything above 
-            or below will be clamped to this range
+        :param clamp_mode: One of [soft, hard, none]
+        :param max_value: The maximum (absolute) value that node and edge values can take. Anything larger
+            than this value will be clamped to be below
         :param value_init: One of [trainable, trainable_batch, random, zeros].  Decides how to initialize node and edges.  
             If using trainable_batch make sure to call graph.init_vals(batch_size=___) BEFORE making an optimizer with graph.parameters().
             Otherwise the initial values will not be registered or trained.
@@ -156,12 +159,15 @@ class NeuralGraph(nn.Module):
         self.n_nodes, self.n_edges, self.connections = n_nodes, len(connections), connections
         self.n_inputs, self.n_outputs = n_inputs, n_outputs
         self.ch_n, self.ch_e, self.ch_k, self.ch_inp, self.ch_out = ch_n, ch_e, ch_k, ch_inp, ch_out
-        self.decay, self.value_range, self.leakage, self.n_models = decay, value_range, leakage, n_models
+        self.decay, self.leakage, self.n_models = decay, leakage, n_models
+        self.clamp_mode, self.max_value = clamp_mode, max_value
         self.value_init, self.set_nodes, self.aggregation, self.use_label = value_init, set_nodes, aggregation, use_label
         self.init_value_std, self.n_heads = init_value_std, n_heads
         self.node_dropout_p, self.edge_dropout_p, self.poolsize = node_dropout_p, edge_dropout_p, poolsize
         self.device = device
         self.pool = None
+
+        assert self.clamp_mode in ["soft", "hard", "none"], f"Unknown clamp_mode option {self.clamp_mode}"
 
         assert self.aggregation in ["attention", "sum", "mean"], f"Unknown aggregation option {self.aggregation}"
         assert self.ch_n % self.n_heads == 0 and self.ch_k % self.n_heads == 0, "ch_n and ch_k need to be divisible by n_heads"
@@ -308,25 +314,23 @@ class NeuralGraph(nn.Module):
 
             if self.leakage > 0:
                 _nodes = (1-self.leakage) * _nodes + self.leakage * agg_leakage
-            self.nodes[:] = _nodes.clamp(*self.value_range)
+
+            if self.clamp_mode == "soft":
+                _nodes = (_nodes/self.max_value).tanh() * self.max_value
+            elif self.clamp_mode == "hard":
+                _nodes = _nodes.clamp(-self.max_value, self.max_value)
+
+            self.nodes[:] = _nodes
 
         if step_edges:
-            self.edges[:] = (edges + m_ab).clamp(*self.value_range)
+            if self.clamp_mode == "soft":
+                self.edges[:] = ((edges + m_ab)/self.max_value).tanh() * self.max_value
+            if self.clamp_mode == "hard":
+                self.edges[:] = (edges + m_ab).clamp(-self.max_value, self.max_value)
+            else:
+                self.edges[:] = edges + m_ab
 
     
-        # # Apply updates
-        # if step_nodes:
-        #     if self.set_nodes:
-        #         # Just set the nodes instead of adding to them
-        #         # Ignores dt
-        #         self.nodes[indices] = ((1-self.leakage)*(1-self.decay)*update+self.leakage*agg_leakage).clamp(*self.value_range)
-        #     else:
-        #         new_node_state = self.nodes[indices] * ((1-self.decay)**dt) + update*dt
-        #         self.nodes[indices] = ((1-self.leakage)*new_node_state+self.leakage*agg_leakage).clamp(*self.value_range)
-
-        # if step_edges:
-        #     self.edges[indices] = (self.edges[indices] + m_ab).clamp(*self.value_range)
-        
     def init_vals(self, nodes=True, edges=True, batch_size=1):
         """
         Initialize nodes and edges.
@@ -507,7 +511,7 @@ class NeuralGraph(nn.Module):
         for t in range(timesteps):
             if not apply_once:
                 self.apply_vals(x)
-            self.timestep(step_nodes=nodes, step_edges=edges, dt=dt, t=t)
+            self.timestep(nodes=nodes, edges=edges, dt=dt, t=t)
         return self.read_outputs()
     
     def backward(self, x, y, time=5, dt=1, apply_once=False, nodes=True, edges=False, edges_at_end=True):
@@ -533,8 +537,8 @@ class NeuralGraph(nn.Module):
         for t in range(timesteps-1):
             if not apply_once:
                 self.apply_vals(x, label=y)
-            self.timestep(step_nodes=nodes, step_edges=edges, dt=dt, t=t)
-        self.timestep(step_nodes=nodes, step_edges=edges or edges_at_end, dt=dt, t=t)
+            self.timestep(nodes=nodes, edges=edges, dt=dt, t=t)
+        self.timestep(nodes=nodes, edges=edges or edges_at_end, dt=dt, t=t)
     
     def predict(self, X, time=5, dt=1, reset_nodes=False, **kwargs):
         """
