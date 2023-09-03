@@ -599,7 +599,7 @@ class NeuralGraph(nn.Module):
             model.load_state_dict(torch.load(f"{path}{name}.pth"))
 
     def save(self, path):
-        self.save(self.state_dict(), path)
+        torch.save(self.state_dict(), path)
     
     def load(self, path):
         self.load_state_dict(torch.load(path))
