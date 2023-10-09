@@ -94,9 +94,11 @@ class Attention(nn.Module):
 class NeuralGraph(nn.Module):
     def __init__(self, n_nodes, n_inputs, n_outputs, connections, ch_n=8, ch_e=8, ch_k=8, ch_inp=1, ch_out=1,
                  decay=0, leakage=0, clamp_mode="soft", max_value=1e6,
-                 value_init="trainable", init_value_std=1, set_nodes=False, aggregation="attention", n_heads=1,
+                 value_init="trainable", batchsize=None, init_value_std=1, set_nodes=False,
+                 aggregation="attention", n_heads=1,
                  use_label=False, node_dropout_p=0, edge_dropout_p=0, poolsize=None, device="cpu",
-                 n_models=1, message_generator=Message, update_generator=Update, attention_generator=Attention, 
+                 n_models=1,
+                 message_generator=Message, update_generator=Update, attention_generator=Attention, 
                  inp_int_generator=InputIntegrator, label_int_generator=LabelIntegrator,
                  out_int_generator=OutputInterpreter):
         """
@@ -166,15 +168,29 @@ class NeuralGraph(nn.Module):
         self.node_dropout_p, self.edge_dropout_p, self.poolsize = node_dropout_p, edge_dropout_p, poolsize
         self.device = device
         self.pool = None
+        self.batchsize = batchsize
 
+        assert self.value_init in ["trainable", "trainable_batch", "random", "zeros"]
         assert self.clamp_mode in ["soft", "hard", "none"], f"Unknown clamp_mode option {self.clamp_mode}"
-
         assert self.aggregation in ["attention", "sum", "mean"], f"Unknown aggregation option {self.aggregation}"
         assert self.ch_n % self.n_heads == 0 and self.ch_k % self.n_heads == 0, "ch_n and ch_k need to be divisible by n_heads"
         
         if self.value_init == "trainable":
-            self.register_parameter("init_nodes", nn.Parameter(torch.randn(self.n_nodes, self.ch_n, device=self.device) * self.init_value_std, requires_grad=True))
-            self.register_parameter("init_edges", nn.Parameter(torch.randn(self.n_edges, self.ch_e, device=self.device) * self.init_value_std, requires_grad=True))
+            self.register_parameter("init_nodes", nn.Parameter(
+                torch.randn(self.n_nodes, self.ch_n, device=self.device) * self.init_value_std,
+                requires_grad=True))
+            self.register_parameter("init_edges", nn.Parameter(
+                torch.randn(self.n_edges, self.ch_e, device=self.device) * self.init_value_std,
+                requires_grad=True))
+
+        if self.value_init == "trainable_batch":
+            assert self.batchsize is not None
+            self.register_parameter("init_nodes", nn.Parameter(
+                torch.randn(self.batchsize, self.n_nodes, self.ch_n, device=self.device) * self.init_value_std,
+                requires_grad=True))
+            self.register_parameter("init_edges", nn.Parameter(
+                torch.randn(self.batchsize, self.n_edges, self.ch_e, device=self.device) * self.init_value_std,
+                requires_grad=True))
 
         self.register_buffer('nodes', torch.zeros(1, self.n_nodes, self.ch_n, device=self.device), persistent=False)
         self.register_buffer('edges', torch.zeros(1, self.n_edges, self.ch_e, device=self.device), persistent=False)
@@ -332,74 +348,57 @@ class NeuralGraph(nn.Module):
                 self.edges[:] = edges + m_ab
 
     
-    def init_vals(self, nodes=True, edges=True, batch_size=1):
+    def init_vals(self, nodes=True, edges=True, batch_size=None):
         """
         Initialize nodes and edges.
         :param nodes: Whether to initialize nodes
         :param edges: Whether to initialize edeges
         :batch_size: Batch size of the initialization
         """
+        assert batch_size is not None or self.batchsize is not None
+        assert batch_size == self.batchsize or batch_size is None or self.batchsize is None
+        bs = batch_size or self.batchsize
+
         if nodes:
-            if self.value_init == "trainable":
-                self.nodes = torch.repeat_interleave((self.init_nodes).clone().unsqueeze(0), batch_size, 0)
-            elif self.value_init == "trainable_batch":
-                if not hasattr(self, "init_nodes"):
-                    self.register_parameter("init_nodes", nn.Parameter(torch.randn(batch_size, self.n_nodes, self.ch_n, device=self.device) * self.init_value_std, requires_grad=True))
-                assert self.init_nodes.shape[0] == batch_size, "trainable_batch is on but batch size changed"
-                self.nodes = self.init_nodes.clone()
-            elif self.value_init == "random":
-                self.nodes = torch.randn(batch_size, self.n_nodes, self.ch_n, device=self.device) * self.init_value_std
-            elif self.value_init == "zeros":
-                self.nodes = torch.zeros(batch_size, self.n_nodes, self.ch_n, device=self.device)
-            else:
-                raise RuntimeError(f"Unknown initial value config {self.value_init}")
-            
+            self.nodes = self._new_node_vals(bs)
         if edges:
-            if self.value_init == "trainable":
-                self.edges = torch.repeat_interleave((self.init_edges).clone().unsqueeze(0), batch_size, 0)
-            elif self.value_init == "trainable_batch":
-                if not hasattr(self, "init_edges"):
-                    self.register_parameter("init_edges", nn.Parameter(torch.randn(batch_size, self.n_edges, self.ch_e, device=self.device) * self.init_value_std, requires_grad=True))
-                assert self.init_edges.shape[0] == batch_size, "trainable_batch is on but batch size changed"
-                self.edges = self.init_edges.clone()
-            elif self.value_init == "random":
-                self.edges = torch.randn(batch_size, self.n_edges, self.ch_e, device=self.device) * self.init_value_std
-            elif self.value_init == "zeros":
-                self.edges = torch.zeros(batch_size, self.n_edges, self.ch_e, device=self.device)
-            else:
-                raise RuntimeError(f"Unknown initial value config {self.value_init}")
+            self.edges = self._new_edge_vals(bs)
     
-    # Reset just one index
     def reset_vals(self, indices=None, nodes=True, edges=True):
-        indices = indices or np.arange(len(self.nodes))
         """
         Reset certain values in pool (or whole batch)
         :param indices: indices in the pool (or batch) to reset
         :param nodes: Whether to reset nodes
         :param edges: Whether to reset edges
         """
+        indices = indices or np.arange(len(self.nodes))
+        if nodes:
+            self.nodes[indices] = self._new_node_vals(len(indices))
+        if edges:
+            self.edges[indices] = self._new_edge_vals(len(indices))
+
+    def _new_node_vals(self, batch_size):
         if self.value_init == "trainable":
-            if nodes:
-                self.nodes[indices] = torch.repeat_interleave(self.init_nodes.clone().unsqueeze(0), len(indices), 0)
-            if edges:
-                self.edges[indices] = torch.repeat_interleave(self.init_edges.clone().unsqueeze(0), len(indices), 0)
-        elif self.value_init == "trainable_batch":
-            if nodes:
-                self.nodes[indices] = self.init_nodes[indices].clone()
-            if edges:
-                self.edges[indices] = self.init_edges[indices].clone()  
-        elif self.value_init == "random":
-            if nodes:
-                self.nodes[indices] = torch.randn(len(indices), self.n_nodes, self.ch_n, device=self.device) * self.init_value_std
-            if edges:
-                self.edges[indices] = torch.randn(len(indices), self.n_edges, self.ch_e, device=self.device) * self.init_value_std
-        elif self.value_init == "zeros":
-            if nodes:
-                self.nodes[indices] = torch.zeros(len(indices), self.n_nodes, self.ch_n, device=self.device)
-            if edges:
-                self.edges[indices] = torch.zeros(len(indices), self.n_edges, self.ch_e, device=self.device)
-        else:
-            raise RuntimeError(f"Unknown initial value config {self.value_init}")
+            return self.init_nodes.expand(batch_size, -1, -1).clone()
+        if self.value_init == "trainable_batch":
+            assert batch_size == self.init_nodes.shape[0]
+            return self.init_nodes.clone()
+        if self.value_init == "random":
+            return torch.randn(batch_size, self.n_nodes, self.ch_n, device=self.device) * self.init_value_std
+        if self.value_init == "zeros":
+            return torch.zeros(batch_size, self.n_nodes, self.ch_n, device=self.device)
+
+    def _new_edge_vals(self, batch_size):
+        if self.value_init == "trainable":
+            return self.init_edges.expand(batch_size, -1, -1).clone()
+        if self.value_init == "trainable_batch":
+            assert batch_size == self.init_edges.shape[0]
+            return self.init_edges.clone()
+        if self.value_init == "random":
+            return torch.randn(batch_size, self.n_edges, self.ch_e, device=self.device) * self.init_value_std
+        if self.value_init == "zeros":
+            return torch.zeros(batch_size, self.n_edges, self.ch_e, device=self.device)
+
 
     def select_pool(self, batch_size=1, explosion_threshold=None, reset=True, losses=None):
         """
