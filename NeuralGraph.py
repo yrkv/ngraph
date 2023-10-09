@@ -187,8 +187,9 @@ class NeuralGraph(nn.Module):
         self.updates = nn.ModuleList([update_generator(ch_n=ch_n).to(self.device) for _ in range(self.n_models)])
         
         if self.aggregation == 'attention':
-            self.multi_head_outa = nn.Linear(self.ch_n, self.ch_n, bias=False).to(self.device)
-            self.multi_head_outb = nn.Linear(self.ch_n, self.ch_n, bias=False).to(self.device)
+            if self.n_heads > 1:
+                self.multi_head_outa = nn.Linear(self.ch_n, self.ch_n, bias=False).to(self.device)
+                self.multi_head_outb = nn.Linear(self.ch_n, self.ch_n, bias=False).to(self.device)
             self.attentions = nn.ModuleList([attention_generator(ch_n=ch_n, ch_k=ch_k).to(self.device) for _ in range(self.n_models)])
         
         self.inp_int = inp_int_generator(ch_inp=ch_inp, ch_n=ch_n).to(self.device)
@@ -199,8 +200,8 @@ class NeuralGraph(nn.Module):
         conn_a, conn_b = zip(*connections)
         self.conn_a = torch.tensor(conn_a).long().to(self.device)
         self.conn_b = torch.tensor(conn_b).long().to(self.device)
-        self.conn_mat = torch.zeros(self.n_nodes, self.n_nodes).to(self.device)
-        self.conn_mat[self.conn_a, self.conn_b] = 1
+        # self.conn_mat = torch.zeros(self.n_nodes, self.n_nodes).to(self.device)
+        # self.conn_mat[self.conn_a, self.conn_b] = 1
         
         self.counts_a = torch.zeros(self.n_nodes, device=self.device).long()
         self.counts_b = torch.zeros(self.n_nodes, device=self.device).long()
@@ -219,11 +220,8 @@ class NeuralGraph(nn.Module):
         :param t: The current timestep (used to decide which set of models to use)
         """
 
-        # t is what cycles through the models
-
         assert self.pool is not None or self.poolsize is None, "No pool selected but poolsize > 0"
 
-        indices = self.pool if self.pool is not None else np.arange(len(self.nodes))
         batch_size = len(self.nodes) if (self.pool is None) else self.poolsize
 
         nodes = self.nodes.clone() if (self.pool is None) else self.nodes[self.pool]
@@ -266,15 +264,18 @@ class NeuralGraph(nn.Module):
             # -> batch, n_edges, ch_n
             heads_b = m_b.reshape(*m_b.shape[:-1], self.n_heads, self.ch_n//self.n_heads) * torch.repeat_interleave(f_attention.unsqueeze(-1), self.ch_n//self.n_heads, -1)
             heads_a = m_a.reshape(*m_a.shape[:-1], self.n_heads, self.ch_n//self.n_heads) * torch.repeat_interleave(b_attention.unsqueeze(-1), self.ch_n//self.n_heads, -1)
-            
-            m_b = self.multi_head_outb(heads_b.reshape(*m_b.shape))
-            m_a = self.multi_head_outa(heads_a.reshape(*m_a.shape))
+            if self.n_heads > 1:
+                m_b = self.multi_head_outb(heads_b.reshape(*m_b.shape))
+                m_a = self.multi_head_outa(heads_a.reshape(*m_a.shape))
+            else:
+                m_b = heads_b.reshape(*m_b.shape)
+                m_a = heads_a.reshape(*m_a.shape)
 
         # TODO: This aggregating code may be wrong
         # agg_m_a = (m_a.view(-1,self.n_nodes,self.n_nodes,self.ch_n) * self.conn_mat[None, :, :, None]).sum(2)
         # agg_m_b = (m_b.view(-1,self.n_nodes,self.n_nodes,self.ch_n) * self.conn_mat[None, :, :, None]).sum(1)
         
-        # Aggregate messages (summing up for now.  Could make it average instead)
+        # Aggregate messages
         agg_m_a = torch.zeros(batch_size, self.n_nodes, self.ch_n, device=self.device)
         agg_m_b = torch.zeros(batch_size, self.n_nodes, self.ch_n, device=self.device)
         agg_m_a.index_add_(1, self.conn_a, m_a)
@@ -428,7 +429,7 @@ class NeuralGraph(nn.Module):
                 i = np.random.randint(self.poolsize)
             self.reset_vals(indices=([i]))
 
-    def apply_vals(self, inp, label=None):
+    def apply_vals(self, inp=None, label=None):
         """
         Apply inputs to input nodes in the graph and labels to output nodes in the graph
         :param inp: The inputs for the graph.  Must be shape (batch_size, n_inputs, ch_inp) unless ch_inp == 1 
@@ -436,22 +437,24 @@ class NeuralGraph(nn.Module):
         :param label: The labels for the graph.  Must be shape (batch_size, n_outputs, ch_out) unless ch_out == 1
             in which case it can just be (batch_size, n_outputs)
         """
-
         assert self.pool is not None or self.poolsize is None, "No pool selected but poolsize was not None"
-        indices = self.pool if self.pool is not None else np.arange(len(self.nodes))
-
-        if not type(inp) == torch.Tensor:
-            inp = torch.tensor(inp, device=self.device)
-        if self.ch_inp == 1 and len(inp.shape) != 3:
-            inp = inp.unsqueeze(-1)
-
-        int_inps = self.inp_int(torch.cat([inp, self.nodes[indices, :self.n_inputs]], axis=2))
+        indices = self.pool if self.pool is not None else torch.arange(len(self.nodes), device=self.device)
         
-        if self.set_nodes:
-            self.nodes[indices, :self.n_inputs] = int_inps
-        else:
-            self.nodes[indices, :self.n_inputs] += int_inps
-        
+        if inp is not None:
+            
+
+            if not type(inp) == torch.Tensor:
+                inp = torch.tensor(inp, device=self.device)
+            if self.ch_inp == 1 and len(inp.shape) != 3:
+                inp = inp.unsqueeze(-1)
+
+            int_inps = self.inp_int(torch.cat([inp, self.nodes[indices, :self.n_inputs]], axis=2))
+            
+            if self.set_nodes:
+                self.nodes[indices, :self.n_inputs] = int_inps
+            else:
+                self.nodes[indices, :self.n_inputs] += int_inps
+            
         if label is not None:
             assert self.use_label, "Tried to apply labels but use_label was set to False"
 
@@ -502,6 +505,8 @@ class NeuralGraph(nn.Module):
         :param apply_once: Whether to apply the input once at the beginning or every timestep
         :param nodes: Whether to update nodes
         :param edges: Whether to update edges
+
+        :return: The output of the graph after running on the inputs
         """
         timesteps = round(time / dt)
 
@@ -591,12 +596,37 @@ class NeuralGraph(nn.Module):
         self.edges = self.edges.detach()
 
     def save_rules(self, path):
-        for name, model in {"_m":self.messages, "_u":self.updates, "_a":self.attentions}.items():
-            torch.save(model.state_dict(), f"{path}{name}.pth")
+
+        ruleset = [
+            (self.messages, "_m"),
+            (self.updates, "_u"),
+            (self.inp_int, "_i"),
+            (self.out_int, "_o"),
+        ]
+
+        if self.aggregation == "attention":
+            ruleset.append((self.attentions, "_a"))
+        if self.use_label:
+            ruleset.append((self.label_int, "_l"))
+
+        for model, suffix in ruleset:
+            torch.save(model.state_dict(), f"{path}{suffix}.pth")
 
     def load_rules(self, path):
-        for name, model in {"_m":self.messages, "_u":self.updates, "_a":self.attentions}.items():
-            model.load_state_dict(torch.load(f"{path}{name}.pth"))
+        ruleset = [
+            (self.messages, "_m"),
+            (self.updates, "_u"),
+            (self.inp_int, "_i"),
+            (self.out_int, "_o"),
+        ]
+
+        if self.aggregation == "attention":
+            ruleset.append((self.attentions, "_a"))
+        if self.use_label:
+            ruleset.append((self.label_int, "_l"))
+
+        for model, suffix in ruleset:
+            model.load_state_dict(torch.load(f"{path}{suffix}.pth"))
 
     def save(self, path):
         torch.save(self.state_dict(), path)
